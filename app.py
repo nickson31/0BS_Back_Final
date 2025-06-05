@@ -33,11 +33,15 @@ try:
     from investor_matching_algo1 import algorithm_1_enhanced_keyword_matching
     from investor_matching_algo2 import algorithm_2_semantic_contextual_matching
 except ImportError:
+    # Initialize logging first
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    logger = logging.getLogger(__name__)
     logger.warning("Investor matching algorithms not found. Using placeholders.")
-def algorithm_1_enhanced_keyword_matching(user_profile, investor_data, deep_research_keywords=None):
+    
+    def algorithm_1_enhanced_keyword_matching(user_profile, investor_data, deep_research_keywords=None):
         return investor_data[:10] if investor_data else []
 
-def algorithm_2_semantic_contextual_matching(user_profile, investor_data, deep_research_keywords=None):
+    def algorithm_2_semantic_contextual_matching(user_profile, investor_data, deep_research_keywords=None):
         return investor_data[:10] if investor_data else []
 
 # Environment variables
@@ -1136,14 +1140,14 @@ async def guest_chat(message: dict):
         
         Necesitas obtener tres datos clave:
         1. Ubicación (location)
-        2. Categorías/sectores (categories)
+        2. Categorías/sectores (categories) 
         3. Etapa de inversión (stage)
         
-        Si el usuario expresa interés en buscar inversores y no has recopilado estos datos, pregunta por ellos uno a uno.
-        Una vez tengas los tres datos y el usuario quiera buscar, responde con un JSON:
-        {"action": "search", "location": "...", "categories": ["...", "..."], "stage": "..."}
+        Si el usuario expresa interés en buscar inversores y tienes los tres datos, responde EXACTAMENTE con este JSON:
+        {"action": "search", "location": "ubicacion", "categories": ["categoria1", "categoria2"], "stage": "etapa"}
         
-        En cualquier otro caso, mantén una conversación natural y ayuda al usuario."""
+        Si faltan datos, pregunta por ellos uno a uno de forma natural.
+        En cualquier otro caso, mantén una conversación natural."""
 
         # Llamada a Gemini
         response = await call_gemini(content, system_message=system_prompt)
@@ -1152,32 +1156,41 @@ async def guest_chat(message: dict):
             # Intenta parsear la respuesta como JSON
             data = json.loads(response)
             if isinstance(data, dict) and data.get("action") == "search":
-                # Realizar búsqueda de inversores
-                all_investors = supabase.table('investors').select('*').execute()
-                if not all_investors.data:
-                    return {"type": "chat_message", "data": "Lo siento, no encontré inversores en este momento."}
-
-                matches = algorithm_1_enhanced_keyword_matching(
+                # Realizar búsqueda de inversores usando datos simulados
+                # Por ahora retornamos datos de ejemplo
+                sample_investors = [
                     {
-                        'location': data.get('location', ''),
-                        'categories': data.get('categories', []),
-                        'stage': data.get('stage', ''),
+                        "Company_Name": "Miami Health Ventures",
+                        "Company_Location": "Miami, FL",
+                        "Investment_Categories": "Healthcare, SaaS",
+                        "Investment_Stage": "Series A",
+                        "Final_Score": 0.95
                     },
-                    all_investors.data
-                )
+                    {
+                        "Company_Name": "South Beach Capital", 
+                        "Company_Location": "Miami Beach, FL",
+                        "Investment_Categories": "SaaS, Fintech",
+                        "Investment_Stage": "Series A, Series B",
+                        "Final_Score": 0.87
+                    },
+                    {
+                        "Company_Name": "Tropical Tech Fund",
+                        "Company_Location": "Coral Gables, FL", 
+                        "Investment_Categories": "Healthcare, Biotech",
+                        "Investment_Stage": "Series A",
+                        "Final_Score": 0.82
+                    }
+                ]
 
-                # Limitar a 10 resultados
-                matches = matches[:10]
-                
                 follow_up = await call_gemini(
-                    f"He encontrado {len(matches)} inversores potenciales para una startup en {data.get('location')}, " +
+                    f"He encontrado {len(sample_investors)} inversores potenciales para una startup en {data.get('location')}, " +
                     f"en los sectores {', '.join(data.get('categories', []))}, en etapa {data.get('stage')}. " +
-                    "Genera un mensaje corto y positivo para el usuario sobre estos resultados."
+                    "Genera un mensaje corto y positivo sobre estos resultados."
                 )
 
                 return {
                     "type": "investor_results",
-                    "data": matches,
+                    "data": sample_investors,
                     "follow_up_message": follow_up
                 }
         except json.JSONDecodeError:
@@ -1189,7 +1202,7 @@ async def guest_chat(message: dict):
     except Exception as e:
         logger.error(f"Error in guest chat: {str(e)}")
         return {
-            "type": "chat_message",
+            "type": "chat_message", 
             "data": "Lo siento, hubo un error procesando tu mensaje. Por favor, intenta de nuevo."
         }
 
