@@ -143,6 +143,7 @@ def set_entity_sentiment_in_db(project_id, user_id, entity_id, entity_type, sent
     except Exception as e:
         print(f"❌ ERROR saving sentiment: {e}")
         return False
+    if __name__ == '__main__':
+    print("Starting Flask server for local testing...")
+    print("🚀 0Bullshit Enhanced Backend READY! 🚀")
     app.run(host='0.0.0.0', port=8080, debug=True)
-
-print("\n🚀 0Bullshit Enhanced Backend READY! 🚀")
