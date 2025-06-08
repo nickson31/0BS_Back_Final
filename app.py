@@ -46,7 +46,7 @@ if not DATABASE_URL:
 # Configure Gemini
 try:
     genai.configure(api_key=API_KEY)
-    MODEL_NAME = "gemini-1.5-flash-latest"
+    MODEL_NAME = "gemini-2.0-flash"
     print("✅ Gemini API configured.")
 except Exception as e:
     print(f"❌ ERROR configuring Gemini: {e}")
