@@ -24,6 +24,8 @@ import sqlalchemy
 from datetime import datetime
 import uuid
 from sqlalchemy import text
+import jwt
+from functools import wraps
 
 # ==============================================================================
 #           CONFIGURATION
@@ -37,6 +39,8 @@ warnings.filterwarnings('ignore')
 # Environment Variables
 API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+JWT_SECRET = os.environ.get("JWT_SECRET", "your-secret-key")
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
 
 if not API_KEY:
     print("❌ FATAL: GEMINI_API_KEY not found.")
@@ -64,6 +68,79 @@ except Exception as e:
 UBICACIONES_TXT_PATH = 'ubicaciones.txt'
 ETAPAS_TXT_PATH = 'etapas.txt'
 CATEGORIAS_TXT_PATH = 'categorias.txt'
+
+# ==============================================================================
+#           AUTHENTICATION MIDDLEWARE
+# ==============================================================================
+
+def verify_supabase_token(token):
+    """Verify Supabase JWT token and return user data."""
+    try:
+        if not SUPABASE_JWT_SECRET:
+            print("⚠️ WARNING: SUPABASE_JWT_SECRET not configured")
+            return None
+        
+        # Decode JWT token
+        payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=['HS256'])
+        user_id = payload.get('sub')
+        
+        if not user_id:
+            return None
+        
+        # Get user profile from database
+        user_query = "SELECT * FROM profiles WHERE id = %s"
+        user_df = pd.read_sql(user_query, engine, params=(user_id,))
+        
+        if user_df.empty:
+            return None
+        
+        return user_df.iloc[0].to_dict()
+        
+    except jwt.ExpiredSignatureError:
+        print("❌ Token expired")
+        return None
+    except jwt.InvalidTokenError:
+        print("❌ Invalid token")
+        return None
+    except Exception as e:
+        print(f"❌ Error verifying token: {e}")
+        return None
+
+def require_auth(f):
+    """Decorator to require authentication."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        auth_header = request.headers.get('Authorization')
+        
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'No authorization token provided'}), 401
+        
+        token = auth_header.split(' ')[1]
+        user_data = verify_supabase_token(token)
+        
+        if not user_data:
+            return jsonify({'error': 'Invalid or expired token'}), 401
+        
+        # Add user data to request
+        request.user = user_data
+        return f(*args, **kwargs)
+    
+    return decorated_function
+
+def get_user_project(user_id):
+    """Get or check if user has a project."""
+    try:
+        project_query = "SELECT * FROM projects WHERE user_id = %s ORDER BY created_at DESC LIMIT 1"
+        project_df = pd.read_sql(project_query, engine, params=(user_id,))
+        
+        if project_df.empty:
+            return None
+        
+        return project_df.iloc[0].to_dict()
+        
+    except Exception as e:
+        print(f"❌ ERROR getting user project: {e}")
+        return None
 
 # ==============================================================================
 #           UTILITY FUNCTIONS
@@ -110,8 +187,8 @@ def get_project_comprehensive_data(project_id):
         JOIN profiles pr ON p.user_id = pr.id
         WHERE p.id = %s
         """
-        # FIX: Use list instead of tuple for params
-        project_result = pd.read_sql(project_query, engine, params=[project_id])
+        # ✅ FIXED: Use tuple for params
+        project_result = pd.read_sql(project_query, engine, params=(project_id,))
         
         if project_result.empty:
             return None, [], 0, "Free"
@@ -120,8 +197,8 @@ def get_project_comprehensive_data(project_id):
         
         # Get conversation history
         conv_query = "SELECT history FROM project_conversations WHERE project_id = %s"
-        # FIX: Use list instead of tuple for params
-        conv_result = pd.read_sql(conv_query, engine, params=[project_id])
+        # ✅ FIXED: Use tuple for params
+        conv_result = pd.read_sql(conv_query, engine, params=(project_id,))
         chat_history = conv_result.iloc[0]['history'] if not conv_result.empty else []
         
         # Count saved investors with positive sentiment
@@ -131,8 +208,8 @@ def get_project_comprehensive_data(project_id):
         JOIN project_sentiments ps ON psi.investor_id = ps.entity_id 
         WHERE psi.project_id = %s AND ps.sentiment = 'like'
         """
-        # FIX: Use list instead of tuple for params
-        saved_count_result = pd.read_sql(saved_count_query, engine, params=[project_id])
+        # ✅ FIXED: Use tuple for params
+        saved_count_result = pd.read_sql(saved_count_query, engine, params=(project_id,))
         saved_investors_count = saved_count_result.iloc[0]['count'] if not saved_count_result.empty else 0
         
         return project_data, chat_history, saved_investors_count, project_data.get('plan', 'Free')
@@ -147,7 +224,7 @@ def save_conversation_message(project_id, user_message, bot_response):
         # Get current conversation history
         _, chat_history, _, _ = get_project_comprehensive_data(project_id)
         
-        # FIX: Ensure bot_response is string
+        # Ensure bot_response is string
         if not isinstance(bot_response, str):
             try:
                 bot_response = json.dumps(bot_response)
@@ -168,23 +245,22 @@ def save_conversation_message(project_id, user_message, bot_response):
         # Keep only last 20 messages
         chat_history = chat_history[-20:]
         
-        # Update database using named parameters
+        # ✅ FIXED: Use positional parameters to avoid double % issues
         update_query = """
         INSERT INTO project_conversations (id, project_id, user_id, history, created_at, updated_at)
-        VALUES (%(id)s, %(project_id)s, (SELECT user_id FROM projects WHERE id = %(project_id_lookup)s), %(history)s, %(created_at)s, %(updated_at)s)
+        VALUES (%s, %s, (SELECT user_id FROM projects WHERE id = %s), %s, %s, %s)
         ON CONFLICT (project_id)
         DO UPDATE SET history = EXCLUDED.history, updated_at = EXCLUDED.updated_at
         """
         
-        # FIX: Use named parameters as dictionary
-        params = {
-            'id': str(uuid.uuid4()),
-            'project_id': project_id,
-            'project_id_lookup': project_id,
-            'history': json.dumps(chat_history),
-            'created_at': datetime.now(),
-            'updated_at': datetime.now()
-        }
+        params = (
+            str(uuid.uuid4()),
+            project_id,
+            project_id,  # for the SELECT
+            json.dumps(chat_history),
+            datetime.now(),
+            datetime.now()
+        )
         
         with engine.connect() as conn:
             conn.execute(text(update_query), params)
@@ -196,8 +272,8 @@ def save_conversation_message(project_id, user_message, bot_response):
 def update_project_status(project_id, new_status):
     """Update project status in database."""
     try:
-        update_query = "UPDATE projects SET status = %(status)s WHERE id = %(project_id)s"
-        params = {'status': new_status, 'project_id': project_id}
+        update_query = "UPDATE projects SET status = %s WHERE id = %s"
+        params = (new_status, project_id)
         
         with engine.connect() as conn:
             conn.execute(text(update_query), params)
@@ -208,14 +284,44 @@ def update_project_status(project_id, new_status):
 def update_project_kpi_data(project_id, kpi_data):
     """Update project KPI data in database."""
     try:
-        update_query = "UPDATE projects SET kpi_data = %(kpi_data)s WHERE id = %(project_id)s"
-        params = {'kpi_data': json.dumps(kpi_data), 'project_id': project_id}
+        update_query = "UPDATE projects SET kpi_data = %s WHERE id = %s"
+        params = (json.dumps(kpi_data), project_id)
         
         with engine.connect() as conn:
             conn.execute(text(update_query), params)
             conn.commit()
     except Exception as e:
         print(f"❌ ERROR updating project KPI data: {e}")
+
+def create_user_project(user_id, project_name):
+    """Create a new project for the user."""
+    try:
+        project_id = str(uuid.uuid4())
+        insert_query = """
+        INSERT INTO projects (id, user_id, project_name, project_description, status, kpi_data, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        params = (
+            project_id,
+            user_id,
+            project_name,
+            "",  # empty description initially
+            "ONBOARDING",
+            json.dumps({}),  # empty KPI data
+            datetime.now(),
+            datetime.now()
+        )
+        
+        with engine.connect() as conn:
+            conn.execute(text(insert_query), params)
+            conn.commit()
+        
+        return project_id
+        
+    except Exception as e:
+        print(f"❌ ERROR creating project: {e}")
+        return None
 
 # ==============================================================================
 #           SEARCH FUNCTIONS (LEGACY PRESERVED)
@@ -615,14 +721,10 @@ Para acceder a búsquedas avanzadas y métricas detalladas, necesitas el plan **
             if sentiment == "like":
                 save_query = """
                 INSERT INTO project_saved_investors (project_id, investor_id, added_at)
-                VALUES (%(project_id)s, %(investor_id)s, %(added_at)s)
+                VALUES (%s, %s, %s)
                 ON CONFLICT (project_id, investor_id) DO NOTHING
                 """
-                params = {
-                    'project_id': project_id,
-                    'investor_id': entity_id,
-                    'added_at': datetime.now()
-                }
+                params = (project_id, entity_id, datetime.now())
                 
                 with engine.connect() as conn:
                     conn.execute(text(save_query), params)
@@ -631,19 +733,19 @@ Para acceder a búsquedas avanzadas y métricas detalladas, necesitas el plan **
             # Add sentiment
             sentiment_query = """
             INSERT INTO project_sentiments (id, project_id, user_id, entity_id, entity_type, sentiment, created_at)
-            VALUES (%(id)s, %(project_id)s, (SELECT user_id FROM projects WHERE id = %(project_id_lookup)s), %(entity_id)s, 'investor', %(sentiment)s, %(created_at)s)
+            VALUES (%s, %s, (SELECT user_id FROM projects WHERE id = %s), %s, 'investor', %s, %s)
             ON CONFLICT (project_id, entity_id, entity_type) 
             DO UPDATE SET sentiment = EXCLUDED.sentiment
             """
             
-            params = {
-                'id': str(uuid.uuid4()),
-                'project_id': project_id,
-                'project_id_lookup': project_id,
-                'entity_id': entity_id,
-                'sentiment': sentiment,
-                'created_at': datetime.now()
-            }
+            params = (
+                str(uuid.uuid4()),
+                project_id,
+                project_id,
+                entity_id,
+                sentiment,
+                datetime.now()
+            )
             
             with engine.connect() as conn:
                 conn.execute(text(sentiment_query), params)
@@ -699,8 +801,8 @@ Has guardado varios inversores interesantes. Para contactarlos de forma profesio
                 ORDER BY psi.added_at ASC
                 LIMIT 1
                 """
-                # FIX: Use list for params
-                result = pd.read_sql(investor_query, engine, params=[project_id])
+                # ✅ FIXED: Use tuple for params
+                result = pd.read_sql(investor_query, engine, params=(project_id,))
                 if not result.empty:
                     target_investor_id = result.iloc[0]['id']
                 else:
@@ -788,8 +890,8 @@ def generate_outreach_template_content(target_entity_id, target_entity_type, pla
             FROM employees WHERE id = %s
             """
         
-        # FIX: Use list for params
-        entity_df = pd.read_sql(entity_query, engine, params=[target_entity_id])
+        # ✅ FIXED: Use tuple for params
+        entity_df = pd.read_sql(entity_query, engine, params=(target_entity_id,))
         
         if entity_df.empty:
             return {"error": f"Could not find {target_entity_type} with ID {target_entity_id}"}
@@ -862,20 +964,20 @@ Saludos,
         template_id = str(uuid.uuid4())
         insert_query = """
         INSERT INTO template_generators (id, project_id, user_id, target_investor_id, platform, conversation_history, generated_template, created_at, updated_at)
-        VALUES (%(id)s, %(project_id)s, %(user_id)s, %(target_investor_id)s, %(platform)s, %(conversation_history)s, %(generated_template)s, %(created_at)s, %(updated_at)s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         
-        params = {
-            'id': template_id,
-            'project_id': project_id,
-            'user_id': project_data['user_id'],
-            'target_investor_id': target_entity_id,
-            'platform': platform,
-            'conversation_history': json.dumps([]),
-            'generated_template': template_content,
-            'created_at': datetime.now(),
-            'updated_at': datetime.now()
-        }
+        params = (
+            template_id,
+            project_id,
+            project_data['user_id'],
+            target_entity_id,
+            platform,
+            json.dumps([]),
+            template_content,
+            datetime.now(),
+            datetime.now()
+        )
         
         with engine.connect() as conn:
             conn.execute(text(insert_query), params)
@@ -904,20 +1006,108 @@ def home():
     """Main route to verify the API is working."""
     return "<h1>0Bullshit - Enhanced Investor Finder API - OK</h1>"
 
+@app.route('/auth/check', methods=['GET'])
+@require_auth
+def check_auth():
+    """Check if user is authenticated and has a project."""
+    try:
+        user_id = request.user['id']
+        user_plan = request.user.get('plan', 'Free')
+        
+        # Check if user has a project
+        project = get_user_project(user_id)
+        
+        if not project:
+            return jsonify({
+                "authenticated": True,
+                "has_project": False,
+                "user": request.user,
+                "message": "No project found. Create one to continue."
+            }), 200
+        
+        return jsonify({
+            "authenticated": True,
+            "has_project": True,
+            "user": request.user,
+            "project": project
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ ERROR in auth check: {e}")
+        return jsonify({"error": "Could not verify authentication"}), 500
+
+@app.route('/projects', methods=['POST'])
+@require_auth
+def create_project():
+    """Create a new project for the authenticated user."""
+    try:
+        data = request.json
+        project_name = data.get('project_name')
+        
+        if not project_name or len(project_name.strip()) < 3:
+            return jsonify({"error": "El nombre del proyecto debe tener al menos 3 caracteres"}), 400
+        
+        user_id = request.user['id']
+        
+        # Check if user already has a project (for Free users, limit to 1)
+        existing_project = get_user_project(user_id)
+        user_plan = request.user.get('plan', 'Free')
+        
+        if existing_project and user_plan == 'Free':
+            return jsonify({
+                "error": "Los usuarios Free solo pueden tener un proyecto. Actualiza tu plan para crear más proyectos."
+            }), 403
+        
+        # Create the project
+        project_id = create_user_project(user_id, project_name.strip())
+        
+        if not project_id:
+            return jsonify({"error": "No se pudo crear el proyecto"}), 500
+        
+        # Get the created project data
+        project_data, _, _, _ = get_project_comprehensive_data(project_id)
+        
+        return jsonify({
+            "message": "Proyecto creado exitosamente",
+            "project": project_data
+        }), 201
+        
+    except Exception as e:
+        print(f"❌ ERROR creating project: {e}")
+        return jsonify({"error": "No se pudo crear el proyecto"}), 500
+
 @app.route('/chat', methods=['POST'])
+@require_auth
 def zero_bullshit_chat_endpoint():
     """Main 0Bullshit conversational endpoint."""
     print("\n--- Request /chat (0Bullshit) ---")
     data = request.json
-    project_id = data.get('project_id')
     user_message = data.get('message')
+    project_id = data.get('project_id')
 
-    if not project_id or not user_message:
-        return jsonify({"error": "project_id and message are required"}), 400
+    if not user_message:
+        return jsonify({"error": "message is required"}), 400
 
-    print(f"  -> Project: {project_id}, Message: '{user_message[:50]}...'")
+    print(f"  -> Message: '{user_message[:50]}...'")
 
     try:
+        user_id = request.user['id']
+        
+        # If no project_id provided, get user's current project
+        if not project_id:
+            project = get_user_project(user_id)
+            if not project:
+                return jsonify({
+                    "type": "need_project",
+                    "content": "Para continuar, necesitas crear un proyecto. Ve a la sección 'Crear Proyecto' y dale un nombre a tu startup."
+                }), 200
+            project_id = project['id']
+        
+        # Verify project belongs to user
+        project_data, _, _, _ = get_project_comprehensive_data(project_id)
+        if not project_data or project_data['user_id'] != user_id:
+            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
+
         # Process the 0Bullshit conversational request
         action_data = process_zero_bullshit_request(project_id, user_message)
         
@@ -938,9 +1128,15 @@ def zero_bullshit_chat_endpoint():
         }), 500
 
 @app.route('/projects/<project_id>/status', methods=['PUT'])
+@require_auth
 def update_project_status_endpoint(project_id):
     """Update project status."""
     try:
+        # Verify project belongs to user
+        project_data, _, _, _ = get_project_comprehensive_data(project_id)
+        if not project_data or project_data['user_id'] != request.user['id']:
+            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
+        
         data = request.json
         new_status = data.get('status')
         
@@ -955,9 +1151,15 @@ def update_project_status_endpoint(project_id):
         return jsonify({"error": "Could not update project status"}), 500
 
 @app.route('/projects/<project_id>/kpi', methods=['PUT'])
+@require_auth
 def update_project_kpi_endpoint(project_id):
     """Update project KPI data."""
     try:
+        # Verify project belongs to user
+        project_data, _, _, _ = get_project_comprehensive_data(project_id)
+        if not project_data or project_data['user_id'] != request.user['id']:
+            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
+        
         data = request.json
         kpi_data = data.get('kpi_data')
         
@@ -972,6 +1174,7 @@ def update_project_kpi_endpoint(project_id):
         return jsonify({"error": "Could not update KPI data"}), 500
 
 @app.route('/projects/<project_id>', methods=['GET'])
+@require_auth
 def get_project_endpoint(project_id):
     """Get comprehensive project data."""
     try:
@@ -979,6 +1182,10 @@ def get_project_endpoint(project_id):
         
         if not project_data:
             return jsonify({"error": "Project not found"}), 404
+        
+        # Verify project belongs to user
+        if project_data['user_id'] != request.user['id']:
+            return jsonify({"error": "No tienes permisos para acceder a este proyecto"}), 403
         
         return jsonify({
             "project": project_data,
@@ -992,9 +1199,15 @@ def get_project_endpoint(project_id):
         return jsonify({"error": "Could not retrieve project data"}), 500
 
 @app.route('/projects/<project_id>/saved-investors', methods=['GET'])
+@require_auth
 def get_saved_investors_endpoint(project_id):
     """Get saved investors with sentiment for a project."""
     try:
+        # Verify project belongs to user
+        project_data, _, _, _ = get_project_comprehensive_data(project_id)
+        if not project_data or project_data['user_id'] != request.user['id']:
+            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
+        
         query = """
         SELECT i.id, i."Company_Name", i."Company_Description", i."Investing_Stage",
                i."Company_Location", i."Investment_Categories", i."Company_Email",
@@ -1007,8 +1220,8 @@ def get_saved_investors_endpoint(project_id):
         ORDER BY psi.added_at DESC
         """
         
-        # FIX: Use list for params
-        results_df = pd.read_sql(query, engine, params=[project_id])
+        # ✅ FIXED: Use tuple for params
+        results_df = pd.read_sql(query, engine, params=(project_id,))
         saved_investors = results_df.fillna('-').to_dict('records')
         
         return jsonify({"saved_investors": saved_investors})
@@ -1018,9 +1231,15 @@ def get_saved_investors_endpoint(project_id):
         return jsonify({"error": "Could not retrieve saved investors"}), 500
 
 @app.route('/projects/<project_id>/templates', methods=['GET'])
+@require_auth
 def get_project_templates_endpoint(project_id):
     """Get generated templates for a project."""
     try:
+        # Verify project belongs to user
+        project_data, _, _, _ = get_project_comprehensive_data(project_id)
+        if not project_data or project_data['user_id'] != request.user['id']:
+            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
+        
         query = """
         SELECT tg.id, tg.target_investor_id, tg.platform, tg.generated_template, 
                tg.created_at, i."Company_Name" as target_name
@@ -1030,8 +1249,8 @@ def get_project_templates_endpoint(project_id):
         ORDER BY tg.created_at DESC
         """
         
-        # FIX: Use list for params
-        results_df = pd.read_sql(query, engine, params=[project_id])
+        # ✅ FIXED: Use tuple for params
+        results_df = pd.read_sql(query, engine, params=(project_id,))
         templates = results_df.fillna('-').to_dict('records')
         
         return jsonify({"templates": templates})
