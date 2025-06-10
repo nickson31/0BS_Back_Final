@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Enhanced Flask Backend API for 0Bullshit - Startup Investment Co-Pilot SaaS
-Implements structured, proactive conversational AI with guided user experience
+0Bullshit - Backend Completo Sin Autenticación 
+Sistema de sesiones temporales con funcionalidad completa
 """
 
 # ==============================================================================
@@ -10,7 +10,7 @@ Implements structured, proactive conversational AI with guided user experience
 # ==============================================================================
 
 print("1. Loading libraries...")
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 import pandas as pd
 import google.generativeai as genai
@@ -24,8 +24,7 @@ import sqlalchemy
 from datetime import datetime
 import uuid
 from sqlalchemy import text
-import jwt
-from functools import wraps
+import secrets
 
 # ==============================================================================
 #           CONFIGURATION
@@ -33,14 +32,13 @@ from functools import wraps
 
 print("2. Configuring application...")
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True)  # Permite sesiones
+app.secret_key = secrets.token_hex(16)  # Para sesiones Flask
 warnings.filterwarnings('ignore')
 
 # Environment Variables
 API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-JWT_SECRET = os.environ.get("JWT_SECRET", "your-secret-key")
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
 
 if not API_KEY:
     print("❌ FATAL: GEMINI_API_KEY not found.")
@@ -68,79 +66,6 @@ except Exception as e:
 UBICACIONES_TXT_PATH = 'ubicaciones.txt'
 ETAPAS_TXT_PATH = 'etapas.txt'
 CATEGORIAS_TXT_PATH = 'categorias.txt'
-
-# ==============================================================================
-#           AUTHENTICATION MIDDLEWARE
-# ==============================================================================
-
-def verify_supabase_token(token):
-    """Verify Supabase JWT token and return user data."""
-    try:
-        if not SUPABASE_JWT_SECRET:
-            print("⚠️ WARNING: SUPABASE_JWT_SECRET not configured")
-            return None
-        
-        # Decode JWT token
-        payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=['HS256'])
-        user_id = payload.get('sub')
-        
-        if not user_id:
-            return None
-        
-        # Get user profile from database
-        user_query = "SELECT * FROM profiles WHERE id = %s"
-        user_df = pd.read_sql(user_query, engine, params=(user_id,))
-        
-        if user_df.empty:
-            return None
-        
-        return user_df.iloc[0].to_dict()
-        
-    except jwt.ExpiredSignatureError:
-        print("❌ Token expired")
-        return None
-    except jwt.InvalidTokenError:
-        print("❌ Invalid token")
-        return None
-    except Exception as e:
-        print(f"❌ Error verifying token: {e}")
-        return None
-
-def require_auth(f):
-    """Decorator to require authentication."""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'No authorization token provided'}), 401
-        
-        token = auth_header.split(' ')[1]
-        user_data = verify_supabase_token(token)
-        
-        if not user_data:
-            return jsonify({'error': 'Invalid or expired token'}), 401
-        
-        # Add user data to request
-        request.user = user_data
-        return f(*args, **kwargs)
-    
-    return decorated_function
-
-def get_user_project(user_id):
-    """Get or check if user has a project."""
-    try:
-        project_query = "SELECT * FROM projects WHERE user_id = %s ORDER BY created_at DESC LIMIT 1"
-        project_df = pd.read_sql(project_query, engine, params=(user_id,))
-        
-        if project_df.empty:
-            return None
-        
-        return project_df.iloc[0].to_dict()
-        
-    except Exception as e:
-        print(f"❌ ERROR getting user project: {e}")
-        return None
 
 # ==============================================================================
 #           UTILITY FUNCTIONS
@@ -176,179 +101,76 @@ def parse_keyword_list(value):
     except (ValueError, SyntaxError):
         return [k.strip().lower() for k in str(value).split(',') if k.strip()]
 
-def get_project_comprehensive_data(project_id):
-    """Retrieve comprehensive project data including user plan and saved investors count."""
-    try:
-        # Get project data with user plan
-        project_query = """
-        SELECT p.id, p.user_id, p.project_name, p.project_description, 
-               p.kpi_data, p.status, pr.plan
-        FROM projects p
-        JOIN profiles pr ON p.user_id = pr.id
-        WHERE p.id = %s
-        """
-        # ✅ FIXED: Use tuple for params
-        project_result = pd.read_sql(project_query, engine, params=(project_id,))
-        
-        if project_result.empty:
-            return None, [], 0, "Free"
-        
-        project_data = project_result.iloc[0].to_dict()
-        
-        # Get conversation history
-        conv_query = "SELECT history FROM project_conversations WHERE project_id = %s"
-        # ✅ FIXED: Use tuple for params
-        conv_result = pd.read_sql(conv_query, engine, params=(project_id,))
-        chat_history = conv_result.iloc[0]['history'] if not conv_result.empty else []
-        
-        # Count saved investors with positive sentiment
-        saved_count_query = """
-        SELECT COUNT(*) as count 
-        FROM project_saved_investors psi
-        JOIN project_sentiments ps ON psi.investor_id = ps.entity_id 
-        WHERE psi.project_id = %s AND ps.sentiment = 'like'
-        """
-        # ✅ FIXED: Use tuple for params
-        saved_count_result = pd.read_sql(saved_count_query, engine, params=(project_id,))
-        saved_investors_count = saved_count_result.iloc[0]['count'] if not saved_count_result.empty else 0
-        
-        return project_data, chat_history, saved_investors_count, project_data.get('plan', 'Free')
-        
-    except Exception as e:
-        print(f"❌ ERROR retrieving comprehensive project data: {e}")
-        return None, [], 0, "Free"
-
-def save_conversation_message(project_id, user_message, bot_response):
-    """Save conversation message to database."""
-    try:
-        # Get current conversation history
-        _, chat_history, _, _ = get_project_comprehensive_data(project_id)
-        
-        # Ensure bot_response is string
-        if not isinstance(bot_response, str):
-            try:
-                bot_response = json.dumps(bot_response)
-            except (TypeError, ValueError):
-                bot_response = str(bot_response)
-        
-        # Add new messages
-        new_messages = [
-            {"role": "user", "content": user_message, "timestamp": datetime.now().isoformat()},
-            {"role": "assistant", "content": bot_response, "timestamp": datetime.now().isoformat()}
-        ]
-        
-        if isinstance(chat_history, list):
-            chat_history.extend(new_messages)
-        else:
-            chat_history = new_messages
-        
-        # Keep only last 20 messages
-        chat_history = chat_history[-20:]
-        
-        # ✅ FIXED: Use positional parameters to avoid double % issues
-        update_query = """
-        INSERT INTO project_conversations (id, project_id, user_id, history, created_at, updated_at)
-        VALUES (%s, %s, (SELECT user_id FROM projects WHERE id = %s), %s, %s, %s)
-        ON CONFLICT (project_id)
-        DO UPDATE SET history = EXCLUDED.history, updated_at = EXCLUDED.updated_at
-        """
-        
-        params = (
-            str(uuid.uuid4()),
-            project_id,
-            project_id,  # for the SELECT
-            json.dumps(chat_history),
-            datetime.now(),
-            datetime.now()
-        )
-        
-        with engine.connect() as conn:
-            conn.execute(text(update_query), params)
-            conn.commit()
-            
-    except Exception as e:
-        print(f"❌ ERROR saving conversation: {e}")
-
-def update_project_status(project_id, new_status):
-    """Update project status in database."""
-    try:
-        update_query = "UPDATE projects SET status = %s WHERE id = %s"
-        params = (new_status, project_id)
-        
-        with engine.connect() as conn:
-            conn.execute(text(update_query), params)
-            conn.commit()
-    except Exception as e:
-        print(f"❌ ERROR updating project status: {e}")
-
-def update_project_kpi_data(project_id, kpi_data):
-    """Update project KPI data in database."""
-    try:
-        update_query = "UPDATE projects SET kpi_data = %s WHERE id = %s"
-        params = (json.dumps(kpi_data), project_id)
-        
-        with engine.connect() as conn:
-            conn.execute(text(update_query), params)
-            conn.commit()
-    except Exception as e:
-        print(f"❌ ERROR updating project KPI data: {e}")
-
-def create_user_project(user_id, project_name):
-    """Create a new project for the user."""
-    try:
+def get_or_create_session_project():
+    """Obtiene o crea un proyecto temporal para la sesión."""
+    if 'project_id' not in session:
+        # Crear proyecto temporal
         project_id = str(uuid.uuid4())
-        insert_query = """
-        INSERT INTO projects (id, user_id, project_name, project_description, status, kpi_data, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
+        user_id = str(uuid.uuid4())  # Usuario temporal
         
-        params = (
-            project_id,
-            user_id,
-            project_name,
-            "",  # empty description initially
-            "ONBOARDING",
-            json.dumps({}),  # empty KPI data
-            datetime.now(),
-            datetime.now()
-        )
-        
-        with engine.connect() as conn:
-            conn.execute(text(insert_query), params)
-            conn.commit()
-        
-        return project_id
-        
-    except Exception as e:
-        print(f"❌ ERROR creating project: {e}")
-        return None
+        try:
+            # Crear usuario temporal en profiles
+            insert_user_query = """
+            INSERT INTO profiles (id, plan, created_at, updated_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """
+            user_params = (user_id, 'Free', datetime.now(), datetime.now())
+            
+            # Crear proyecto temporal
+            insert_project_query = """
+            INSERT INTO projects (id, user_id, project_name, project_description, status, kpi_data, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """
+            project_params = (
+                project_id, user_id, "Sesión Temporal", "", "ACTIVE", 
+                json.dumps({}), datetime.now(), datetime.now()
+            )
+            
+            with engine.connect() as conn:
+                conn.execute(text(insert_user_query), user_params)
+                conn.execute(text(insert_project_query), project_params)
+                conn.commit()
+            
+            session['project_id'] = project_id
+            session['user_id'] = user_id
+            print(f"✅ Created temporary session: project_id={project_id}")
+            
+        except Exception as e:
+            print(f"❌ ERROR creating session project: {e}")
+            # Fallback a IDs temporales sin BD
+            session['project_id'] = project_id
+            session['user_id'] = user_id
+    
+    return session['project_id'], session['user_id']
 
 # ==============================================================================
-#           SEARCH FUNCTIONS (LEGACY PRESERVED)
+#           ALGORITMOS DE MATCHING DE INVERSORES
 # ==============================================================================
 
 def get_keywords_from_gemini_v2(query, u_ctx, e_ctx, c_ctx, model_name):
-    """Get advanced keywords (primary and expanded) using Gemini."""
-    print("  -> Calling Gemini (Advanced)...")
+    """Obtiene keywords avanzadas usando Gemini para matching de inversores."""
+    print("  -> Calling Gemini for Investor Keywords...")
     start_time = time.time()
     response_text = "N/A"
     try:
         model = genai.GenerativeModel(model_name)
-        prompt = f"""**Task:** Analyze the query and extract/expand keywords (Location, Stage, Categories).
+        prompt = f"""**Task:** Analiza la consulta y extrae keywords para búsqueda de inversores (Ubicación, Etapa, Categorías).
 
 **Query:** "{query}"
 
 **Instructions:**
-1. **Analyze** the query to identify Locations, Stages and Categories.
-2. **Standardize & Infer:** Use contexts to standardize and infer primary keywords.
-3. **Expand Keywords:** Generate 5-10 'expanded' keywords *highly relevant* for each 'primary'.
-4. **Exact JSON Format:** {{"ubicacion": {{"primary": [...], "expanded": [...]}}, "etapa": {{"primary": [...], "expanded": [...]}}, "categoria": {{"primary": [...], "expanded": [...]}}}}
+1. **Analiza** la consulta para identificar Ubicaciones, Etapas y Categorías de inversión.
+2. **Estandariza e Infiere:** Usa los contextos para estandarizar e inferir keywords primarias.
+3. **Expande Keywords:** Genera 5-10 keywords 'expandidas' altamente relevantes para cada 'primaria'.
+4. **Formato JSON Exacto:** {{"ubicacion": {{"primary": [...], "expanded": [...]}}, "etapa": {{"primary": [...], "expanded": [...]}}, "categoria": {{"primary": [...], "expanded": [...]}}}}
 
-**Location Context (Ex.):**\n{u_ctx[:1000]}...
+**Location Context:**\n{u_ctx[:1000]}...
 
-**Stage Context (Ex.):**\n{e_ctx[:1000]}...
+**Stage Context:**\n{e_ctx[:1000]}...
 
-**Category Context (Ex.):**\n{c_ctx[:1000]}...
+**Category Context:**\n{c_ctx[:1000]}...
 
 **Required JSON Output:**\n```json\n{{ ... }}\n```"""
 
@@ -374,14 +196,14 @@ def get_keywords_from_gemini_v2(query, u_ctx, e_ctx, c_ctx, model_name):
             if cat in keywords and isinstance(keywords[cat], dict):
                 final_keywords[cat]["primary"] = [str(k).strip().lower() for k in keywords[cat].get("primary", [])]
                 final_keywords[cat]["expanded"] = [str(k).strip().lower() for k in keywords[cat].get("expanded", [])]
-        print(f"  ✅ Advanced keywords ({time.time() - start_time:.2f}s): {final_keywords}")
+        print(f"  ✅ Investor keywords ({time.time() - start_time:.2f}s): {final_keywords}")
         return final_keywords
     except Exception as e:
-        print(f"  ❌ ERROR with Gemini (Advanced): {e}\nResponse: {response_text}")
+        print(f"  ❌ ERROR with Gemini (Investor Keywords): {e}\nResponse: {response_text}")
         return None
 
 def calculate_match_score_v2(row, query_kws):
-    """Calculate advanced score (normalized) and matching keywords."""
+    """Calculate advanced score (normalized) and matching keywords for investors."""
     investor_u = set(row['Ubicacion_List'])
     investor_e = set(row['Etapa_List'])
     investor_c = set(row['Categoria_List'])
@@ -430,17 +252,16 @@ def calculate_match_score_v2(row, query_kws):
 
     return raw_score, normalized_score, matched_u, matched_e, matched_c
 
-def run_investor_search(project_data):
-    """Execute deep investor search based on project data."""
+def run_investor_search_normal(query):
+    """Ejecuta búsqueda NORMAL de inversores (50 mejores resultados)."""
     if not engine:
         return {"error": "No database connection."}
 
-    print("-> Starting deep investor search...")
+    print("-> Starting NORMAL investor search...")
     try:
         sql_query = """
         SELECT id, "Company_Name", "Company_Description", "Investing_Stage",
-               "Investing_Type", "Company_Location", "Investment_Categories",
-               "Company_Email", "Company_Phone", "Company_Linkedin", "Company_Website",
+               "Company_Location", "Investment_Categories", "Company_Linkedin",
                "Keywords_Ubicacion_Adicionales", "Keywords_Etapas_Adicionales", 
                "Keywords_Categorias_Adicionales" 
         FROM investors
@@ -452,526 +273,460 @@ def run_investor_search(project_data):
         investors_df['Etapa_List'] = investors_df['Keywords_Etapas_Adicionales'].apply(parse_keyword_list)
         investors_df['Categoria_List'] = investors_df['Keywords_Categorias_Adicionales'].apply(parse_keyword_list)
 
-        # Build intelligent query from project data
-        query_parts = []
-        if project_data.get('project_description'):
-            query_parts.append(project_data['project_description'])
-        
-        kpi_data = project_data.get('kpi_data', {})
-        if isinstance(kpi_data, str):
-            kpi_data = json.loads(kpi_data)
-        
-        # Add relevant KPI context
-        if kpi_data.get('ingresos_mensuales'):
-            query_parts.append(f"Ingresos mensuales: {kpi_data['ingresos_mensuales']}")
-        if kpi_data.get('runway'):
-            query_parts.append(f"Runway: {kpi_data['runway']} meses")
-        
-        search_query = " ".join(query_parts)
-        
         query_keywords = get_keywords_from_gemini_v2(
-            search_query, ubicaciones_context, etapas_context, categorias_context, MODEL_NAME
+            query, ubicaciones_context, etapas_context, categorias_context, MODEL_NAME
         )
 
         if not query_keywords:
             return {"error": "Could not obtain keywords."}
 
-        print("  -> Applying scoring...")
+        print("  -> Applying NORMAL scoring...")
         
         score_results = investors_df.apply(lambda row: calculate_match_score_v2(row, query_keywords), axis=1, result_type='expand')
         score_results.columns = ['Score_Raw', 'Score', 'Matched_Ubicacion', 'Matched_Etapa', 'Matched_Categoria']
         investors_df = investors_df.join(score_results)
         results_df = investors_df[investors_df['Score'] > 0].sort_values(by='Score', ascending=False).head(50)
 
-        # Columns to return to frontend
+        # Columnas específicas que quiere mostrar el usuario
         cols_to_show = [
             'id', 'Company_Name', 'Company_Description', 'Investing_Stage',
-            'Company_Location', 'Investment_Categories',
-            'Company_Email', 'Company_Phone', 'Company_Linkedin', 'Company_Website',
-            'Score'
+            'Company_Location', 'Investment_Categories', 'Company_Linkedin', 'Score'
         ]
 
         results_df['Score'] = results_df['Score'].map('{:,.1f}'.format)
         results_df = results_df.fillna('-')
-        print(f"  ✅ Deep search completed, {len(results_df)} results.")
+        print(f"  ✅ NORMAL search completed, {len(results_df)} results.")
         
-        return results_df[[c for c in cols_to_show if c in results_df.columns]].to_dict('records')
+        return {
+            "search_type": "normal",
+            "results": results_df[[c for c in cols_to_show if c in results_df.columns]].to_dict('records'),
+            "total_found": len(results_df)
+        }
 
     except Exception as e:
-        print(f"  ❌ ERROR in investor search: {e}")
-        return {"error": f"Error in search: {e}"}
+        print(f"  ❌ ERROR in normal investor search: {e}")
+        return {"error": f"Error in normal search: {e}"}
 
-# ==============================================================================
-#           0BULLSHIT MASTER PROMPT AND AI ORCHESTRATOR
-# ==============================================================================
+def run_investor_search_deep(query):
+    """Ejecuta búsqueda DEEP RESEARCH de inversores."""
+    if not engine:
+        return {"error": "No database connection."}
 
-def get_zero_bullshit_master_prompt():
-    """Return the 0Bullshit master prompt for conversational AI orchestration."""
-    return """## ROL Y PERSONALIDAD
-
-Eres "0Bullshit", un co-piloto de IA experto en fundraising para fundadores de startups y pymes. Tu misión es democratizar el acceso a capital y know-how, eliminando la "bullshit" (paja, rodeos, información inútil) del proceso. 
-
-Tu tono es:
-- **Directo y Rápido:** Vas al grano para ahorrar tiempo. Usas frases como "¡Genial!", "Anotado.", "Perfecto." 
-- **Proactivo y Guía:** No esperas a que el usuario te pida las cosas. Tú inicias el proceso de recolección de datos y sugieres los siguientes pasos. 
-- **Orientado a Valor:** Justificas tus recomendaciones con datos (ej. "elevan 90% su probabilidad de cerrar ronda"). 
-
-## CONTEXTO DE LA CONVERSACIÓN
-
-1. **Datos del Proyecto:** {project_data}
-2. **Historial del Chat:** {chat_history}
-3. **Plan del Usuario:** {user_plan}
-4. **Inversores Guardados (Liked):** {saved_investors_count}
-5. **Mensaje del Usuario:** {user_message}
-
-## FLUJO DE TRABAJO ESTRUCTURADO Y REGLAS
-
-Tu comportamiento principal depende del `status` del proyecto:
-
-**A. SI `status` es 'ONBOARDING':**
-Tu objetivo es rellenar los `kpi_data`. Revisa los datos del proyecto y haz la siguiente pregunta lógica en orden:
-1. Si `project_description` está vacío: Pregunta por el problema que resuelven.
-2. Si falta el "tuit": Pide la propuesta en <=140 caracteres.
-3. Si faltan `ingresos_mensuales`, `margen_bruto` o `runway`: Pídelos. 
-4. Si faltan `CAC`, `repeat_rate`, etc.: Pídelos. 
-5. **REGLA DE UPSELL (GROWTH):** Antes de pedir los últimos KPIs (CAC, etc.), si el plan del usuario es 'Free', DEBES usar la herramienta `trigger_growth_upsell`. No hagas la pregunta. 
-
-**B. SI `status` es 'SEARCH_READY':**
-1. Si el usuario da una señal para buscar (ej. "listo", "busca ahora", "ok, sigamos"), tu DEBER es usar la herramienta `run_investor_search`. 
-2. Si el usuario indica "Like" o "Dislike" sobre un inversor, usa `set_entity_sentiment`.
-3. **REGLA DE UPSELL (OUTREACH):** Si el `saved_investors_count` llega a 3 y el plan del usuario no es 'Outreach', DEBES usar la herramienta `trigger_outreach_upsell`. 
-
-**C. SI `status` es 'OUTREACH_READY':**
-1. Si el usuario pide un ejemplo de mensaje o quiere empezar a contactar, usa `generate_outreach_example`. 
-2. Si el usuario dice "adelante" o "activa outreach", usa `confirm_outreach_activation`.
-
-## HERRAMIENTAS Y FORMATO DE SALIDA
-
-Tu respuesta debe ser SIEMPRE un único objeto JSON, sin texto adicional.
-
-**FORMATO OBLIGATORIO:**
-{{
-  "action": "nombre_de_la_herramienta",
-  "parameters": {{ ... }}
-}}
-
-**LISTA DE HERRAMIENTAS:**
-- `ask_onboarding_question(question_text: str)`: Para hacer la siguiente pregunta del proceso de onboarding.
-- `trigger_growth_upsell()`: Muestra el mensaje de venta del plan Growth.
-- `confirm_plan_activation(plan_name: str)`: Confirma que un plan ha sido activado.
-- `run_investor_search()`: Inicia la búsqueda profunda de inversores.
-- `set_entity_sentiment(entity_id: str, sentiment: str)`: Para guardar un "like" o "dislike".
-- `trigger_outreach_upsell()`: Muestra el mensaje de venta del plan Outreach.
-- `generate_outreach_example(target_investor_id: str)`: Genera un borrador de mensaje.
-- `answer_general_chat(response_text: str)`: Para conversación que no encaje en el flujo principal.
-
-**EJEMPLO DE RAZONAMIENTO:**
-- **Usuario:** "Reducimos la factura eléctrica de pequeños comercios..." 
-- **Mi estado mental:** OK, `status` es `ONBOARDING`. `project_description` está relleno. Lo siguiente es el "tuit".
-- **Mi salida JSON:**
-  ```json
-  {{
-    "action": "ask_onboarding_question",
-    "parameters": {{
-      "question_text": "Perfecto: 'Ahorro energético para comercio minorista'. Ahora condensa tu propuesta en <=140 caracteres (un tuit rápido)."
-    }}
-  }}
-  ```
-
-**INSTRUCCIÓN FINAL:**
-Analiza el contexto y devuelve el JSON de la acción apropiada. No agregues texto antes o después del JSON."""
-
-def process_zero_bullshit_request(project_id, user_message):
-    """Process request using 0Bullshit orchestrator."""
+    print("-> Starting DEEP RESEARCH investor search...")
     try:
-        # Get comprehensive project context
-        project_data, chat_history, saved_investors_count, user_plan = get_project_comprehensive_data(project_id)
+        # Primero hacemos la búsqueda normal
+        normal_results = run_investor_search_normal(query)
+        if "error" in normal_results:
+            return normal_results
         
-        if not project_data:
+        # Luego aplicamos análisis más profundo usando Gemini
+        print("  -> Applying DEEP RESEARCH analysis...")
+        
+        model = genai.GenerativeModel(MODEL_NAME)
+        deep_prompt = f"""
+**DEEP RESEARCH TASK:** Analiza esta consulta de startup y proporciona insights avanzados para matching de inversores.
+
+**Consulta:** "{query}"
+
+**Tu tarea:**
+1. Identifica el sector/industria exacto
+2. Determina la etapa de inversión más probable
+3. Identifica factores de riesgo y oportunidades
+4. Sugiere tipos de inversores ideales
+5. Calcula métricas de compatibilidad adicionales
+
+**Responde en formato conciso (máximo 200 palabras):**
+- Sector principal: [sector]
+- Etapa recomendada: [etapa]
+- Factores clave: [3-4 factores]
+- Timing: [análisis de timing del mercado]
+"""
+        
+        deep_analysis = model.generate_content(deep_prompt)
+        
+        print(f"  ✅ DEEP RESEARCH completed, {normal_results['total_found']} results with advanced analysis.")
+        
+        return {
+            "search_type": "deep_research",
+            "results": normal_results["results"],
+            "total_found": normal_results["total_found"],
+            "deep_analysis": deep_analysis.text,
+            "insights": "Análisis profundo aplicado con factores de riesgo, oportunidades y métricas avanzadas"
+        }
+
+    except Exception as e:
+        print(f"  ❌ ERROR in deep investor search: {e}")
+        return {"error": f"Error in deep search: {e}"}
+
+# ==============================================================================
+#           ALGORITMO DE BÚSQUEDA DE EMPLEADOS DE FONDOS
+# ==============================================================================
+
+def find_employees_from_investors(investor_results, search_type="normal"):
+    """
+    LÓGICA CORRECTA: 
+    1. Toma los 50 mejores fondos de inversión encontrados
+    2. Extrae sus Company_Name 
+    3. Busca TODOS los empleados que trabajan en esos fondos con decision_score > 44
+    """
+    if not engine:
+        return {"error": "No database connection."}
+
+    print(f"-> Finding employees from {search_type} investor search...")
+    
+    try:
+        # Extraer los nombres de las empresas de inversión
+        if "results" not in investor_results:
+            return {"error": "No investor results provided"}
+        
+        investor_companies = []
+        for investor in investor_results["results"]:
+            company_name = investor.get("Company_Name", "").strip()
+            if company_name and company_name != "-":
+                investor_companies.append(company_name)
+        
+        if not investor_companies:
+            return {"error": "No valid company names found in investor results"}
+        
+        print(f"  -> Searching employees in {len(investor_companies)} investment firms...")
+        
+        # Crear la consulta SQL para buscar empleados en esas empresas
+        # Usar ILIKE para búsqueda case-insensitive y filtrar por decision_score > 44
+        company_conditions = " OR ".join([f'"Company_Name" ILIKE %s' for _ in investor_companies])
+        
+        sql_query = f"""
+        SELECT id, "fullName", "headline", "current_job_title", "location", 
+               "linkedinUrl", "email", "profilePic", "Company_Name",
+               "decision_score"
+        FROM employees
+        WHERE ({company_conditions}) AND "decision_score" > 44
+        ORDER BY "decision_score" DESC, "Company_Name", "current_job_title"
+        """
+        
+        # Preparar parámetros para la consulta (agregar % para búsqueda parcial)
+        params = [f"%{company}%" for company in investor_companies]
+        
+        employees_df = pd.read_sql(sql_query, engine, params=params)
+        
+        print(f"  -> Found {len(employees_df)} high-quality employees (score > 44) across {len(investor_companies)} investment firms")
+        
+        if employees_df.empty:
             return {
-                "action": "answer_general_chat",
-                "parameters": {
-                    "response_text": "Lo siento, no pude encontrar tu proyecto. Por favor, verifica el ID del proyecto."
-                }
+                "search_type": "fund_employees", 
+                "from_search": search_type,
+                "results": [],
+                "total_found": 0,
+                "searched_funds": investor_companies,
+                "message": "No se encontraron empleados con score > 44 en los fondos seleccionados"
             }
         
-        # Prepare the master prompt with context
-        master_prompt = get_zero_bullshit_master_prompt().format(
-            project_data=json.dumps(project_data, ensure_ascii=False),
-            chat_history=json.dumps(chat_history[-10:] if chat_history else [], ensure_ascii=False),
-            user_plan=user_plan,
-            saved_investors_count=saved_investors_count,
-            user_message=user_message
+        # Preparar columnas para mostrar (las que especificó el usuario)
+        cols_to_show = [
+            'id', 'fullName', 'headline', 'current_job_title', 'location',
+            'linkedinUrl', 'email', 'profilePic'
+        ]
+        
+        # Limpiar datos
+        employees_df = employees_df.fillna('-')
+        
+        # Agrupar por empresa para mejor presentación
+        employees_by_fund = {}
+        for _, employee in employees_df.iterrows():
+            fund_name = employee['Company_Name']
+            if fund_name not in employees_by_fund:
+                employees_by_fund[fund_name] = []
+            employees_by_fund[fund_name].append(employee.to_dict())
+        
+        print(f"  ✅ Employee search completed: {len(employees_df)} high-quality employees from {len(employees_by_fund)} funds")
+        
+        return {
+            "search_type": "fund_employees",
+            "from_search": search_type,
+            "results": employees_df[[c for c in cols_to_show if c in employees_df.columns]].to_dict('records'),
+            "employees_by_fund": employees_by_fund,
+            "total_found": len(employees_df),
+            "funds_found": len(employees_by_fund),
+            "searched_funds": investor_companies
+        }
+
+    except Exception as e:
+        print(f"  ❌ ERROR in employee search from investors: {e}")
+        return {"error": f"Error finding employees from investment firms: {e}"}
+
+def run_employee_search(query, search_type="normal"):
+    """
+    Función principal para búsqueda de empleados:
+    1. Primero busca los 50 mejores fondos con el query
+    2. Luego encuentra TODOS los empleados de esos fondos con decision_score > 44
+    """
+    print(f"-> Starting {search_type} employee search for: '{query[:50]}...'")
+    
+    try:
+        # PASO 1: Buscar los mejores fondos de inversión
+        if search_type == "deep":
+            investor_results = run_investor_search_deep(query)
+        else:
+            investor_results = run_investor_search_normal(query)
+        
+        if "error" in investor_results:
+            return {
+                "error": f"Error finding relevant investment funds: {investor_results['error']}"
+            }
+        
+        print(f"  -> Found {investor_results.get('total_found', 0)} relevant investment funds")
+        
+        # PASO 2: Buscar empleados en esos fondos
+        employee_results = find_employees_from_investors(investor_results, search_type)
+        
+        if "error" in employee_results:
+            return employee_results
+        
+        # PASO 3: Combinar resultados
+        combined_results = {
+            "search_type": f"combined_{search_type}",
+            "query": query,
+            "relevant_funds": investor_results["results"][:10],  # Solo los top 10 fondos para contexto
+            "total_funds_found": investor_results.get("total_found", 0),
+            "employees": employee_results["results"],
+            "employees_by_fund": employee_results.get("employees_by_fund", {}),
+            "total_employees_found": employee_results.get("total_found", 0),
+            "funds_with_employees": employee_results.get("funds_found", 0)
+        }
+        
+        # Si es deep research, incluir el análisis
+        if search_type == "deep" and "deep_analysis" in investor_results:
+            combined_results["deep_analysis"] = investor_results["deep_analysis"]
+            combined_results["insights"] = investor_results.get("insights", "")
+        
+        return combined_results
+
+    except Exception as e:
+        print(f"  ❌ ERROR in combined employee search: {e}")
+        return {"error": f"Error in employee search: {e}"}
+
+# ==============================================================================
+#           FUNCIONES DE SESIÓN Y GESTIÓN DE DATOS
+# ==============================================================================
+
+def save_investor_to_session(project_id, user_id, investor_id):
+    """Guarda un inversor en la sesión del proyecto."""
+    try:
+        insert_query = """
+        INSERT INTO project_saved_investors (project_id, investor_id, added_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (project_id, investor_id) DO NOTHING
+        """
+        params = (project_id, investor_id, datetime.now())
+        
+        with engine.connect() as conn:
+            conn.execute(text(insert_query), params)
+            conn.commit()
+        
+        return True
+    except Exception as e:
+        print(f"❌ ERROR saving investor to session: {e}")
+        return False
+
+def save_employee_to_session(project_id, user_id, employee_id):
+    """Guarda un empleado en la sesión del proyecto."""
+    try:
+        insert_query = """
+        INSERT INTO project_saved_employees (project_id, employee_id, added_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (project_id, employee_id) DO NOTHING
+        """
+        params = (project_id, employee_id, datetime.now())
+        
+        with engine.connect() as conn:
+            conn.execute(text(insert_query), params)
+            conn.commit()
+        
+        return True
+    except Exception as e:
+        print(f"❌ ERROR saving employee to session: {e}")
+        return False
+
+def save_sentiment(project_id, user_id, entity_id, entity_type, sentiment):
+    """Guarda el sentiment (like/dislike) de una entidad."""
+    try:
+        insert_query = """
+        INSERT INTO project_sentiments (id, project_id, user_id, entity_id, entity_type, sentiment, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (project_id, entity_id, entity_type) 
+        DO UPDATE SET sentiment = EXCLUDED.sentiment, created_at = EXCLUDED.created_at
+        """
+        
+        params = (
+            str(uuid.uuid4()),
+            project_id,
+            user_id,
+            entity_id,
+            entity_type,
+            sentiment,
+            datetime.now()
         )
         
-        # Call Gemini
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(master_prompt)
-        response_text = response.text.strip()
+        with engine.connect() as conn:
+            conn.execute(text(insert_query), params)
+            conn.commit()
         
-        # Extract JSON from response
-        json_match = re.search(r'```json\s*([\s\S]+?)\s*```', response_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1).strip()
-        else:
-            # Try to find JSON without code blocks
-            json_match = re.search(r'(\{[\s\S]*\})', response_text)
-            if json_match:
-                json_str = json_match.group(1).strip()
-            else:
-                json_str = response_text
+        return True
+    except Exception as e:
+        print(f"❌ ERROR saving sentiment: {e}")
+        return False
+
+def get_saved_investors(project_id):
+    """Obtiene los inversores guardados de la sesión."""
+    try:
+        query = """
+        SELECT i.id, i."Company_Name", i."Company_Description", i."Investing_Stage",
+               i."Company_Location", i."Investment_Categories", i."Company_Linkedin",
+               psi.added_at, COALESCE(ps.sentiment, 'none') as sentiment
+        FROM project_saved_investors psi
+        JOIN investors i ON psi.investor_id = i.id
+        LEFT JOIN project_sentiments ps ON i.id = ps.entity_id AND ps.project_id = psi.project_id
+        WHERE psi.project_id = %s
+        ORDER BY psi.added_at DESC
+        """
         
-        # Parse JSON
-        action_data = json.loads(json_str)
-        return action_data
+        results_df = pd.read_sql(query, engine, params=(project_id,))
+        return results_df.fillna('-').to_dict('records')
         
     except Exception as e:
-        print(f"❌ ERROR processing 0Bullshit request: {e}")
-        return {
-            "action": "answer_general_chat",
-            "parameters": {
-                "response_text": "Disculpa, tuve un error procesando tu solicitud. Inténtalo de nuevo o reformula tu pregunta."
-            }
-        }
+        print(f"❌ ERROR getting saved investors: {e}")
+        return []
 
-# ==============================================================================
-#           ACTION EXECUTION FUNCTIONS
-# ==============================================================================
-
-def execute_zero_bullshit_action(action_data, project_id):
-    """Execute the determined action for 0Bullshit workflow."""
-    action = action_data.get("action")
-    parameters = action_data.get("parameters", {})
-    
-    if action == "ask_onboarding_question":
-        question_text = parameters.get("question_text", "¿Puedes contarme más sobre tu proyecto?")
-        return {
-            "type": "onboarding_question",
-            "content": question_text
-        }
-    
-    elif action == "trigger_growth_upsell":
-        upsell_message = """
-🚀 **¡Momento de crecer!** 
-
-Para acceder a búsquedas avanzadas y métricas detalladas, necesitas el plan **Growth**:
-
-✅ Búsquedas ilimitadas de inversores
-✅ Análisis de compatibilidad avanzado  
-✅ Exportar resultados a Excel
-✅ Soporte prioritario
-
-**$29/mes** - Cancela cuando quieras
-
-¿Activamos Growth para desbloquear todo el potencial de tu búsqueda?
-"""
-        return {
-            "type": "plan_upsell",
-            "content": upsell_message,
-            "plan": "Growth",
-            "price": "$29/mes"
-        }
-    
-    elif action == "confirm_plan_activation":
-        plan_name = parameters.get("plan_name", "Growth")
-        return {
-            "type": "plan_confirmed",
-            "content": f"¡Perfecto! Plan {plan_name} activado. Ahora tienes acceso completo. ¡Sigamos!"
-        }
-    
-    elif action == "run_investor_search":
-        # Get project data for search
-        project_data, _, _, _ = get_project_comprehensive_data(project_id)
-        if not project_data:
-            return {
-                "type": "error",
-                "content": "No se pudo acceder a los datos del proyecto."
-            }
-        
-        search_results = run_investor_search(project_data)
-        
-        if isinstance(search_results, dict) and "error" in search_results:
-            return {
-                "type": "error",
-                "content": search_results["error"]
-            }
-        
-        # Update project status to SEARCH_READY if not already
-        if project_data.get('status') == 'ONBOARDING':
-            update_project_status(project_id, 'SEARCH_READY')
-        
-        return {
-            "type": "investor_results",
-            "content": search_results,
-            "message": f"¡Encontré {len(search_results)} inversores potenciales! Revisa los resultados y marca como 'Like' los que más te interesen."
-        }
-    
-    elif action == "set_entity_sentiment":
-        entity_id = parameters.get("entity_id")
-        sentiment = parameters.get("sentiment", "like").lower()
-        
-        if not entity_id:
-            return {
-                "type": "error",
-                "content": "Se requiere el ID de la entidad."
-            }
-        
-        try:
-            # Add to saved investors if liked
-            if sentiment == "like":
-                save_query = """
-                INSERT INTO project_saved_investors (project_id, investor_id, added_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (project_id, investor_id) DO NOTHING
-                """
-                params = (project_id, entity_id, datetime.now())
-                
-                with engine.connect() as conn:
-                    conn.execute(text(save_query), params)
-                    conn.commit()
-            
-            # Add sentiment
-            sentiment_query = """
-            INSERT INTO project_sentiments (id, project_id, user_id, entity_id, entity_type, sentiment, created_at)
-            VALUES (%s, %s, (SELECT user_id FROM projects WHERE id = %s), %s, 'investor', %s, %s)
-            ON CONFLICT (project_id, entity_id, entity_type) 
-            DO UPDATE SET sentiment = EXCLUDED.sentiment
-            """
-            
-            params = (
-                str(uuid.uuid4()),
-                project_id,
-                project_id,
-                entity_id,
-                sentiment,
-                datetime.now()
-            )
-            
-            with engine.connect() as conn:
-                conn.execute(text(sentiment_query), params)
-                conn.commit()
-            
-            return {
-                "type": "sentiment_saved",
-                "content": f"¡Anotado! Inversor marcado como '{sentiment}'"
-            }
-            
-        except Exception as e:
-            print(f"❌ ERROR saving sentiment: {e}")
-            return {
-                "type": "error",
-                "content": "No se pudo guardar la preferencia."
-            }
-    
-    elif action == "trigger_outreach_upsell":
-        upsell_message = """
-💼 **¡Es hora del Outreach!**
-
-Has guardado varios inversores interesantes. Para contactarlos de forma profesional, necesitas el plan **Outreach**:
-
-✅ Plantillas de email personalizadas
-✅ Mensajes de LinkedIn optimizados
-✅ Seguimiento automático
-✅ Analytics de respuestas
-✅ CRM integrado
-
-**$99/mes** - ROI garantizado
-
-¿Activamos Outreach para empezar a contactar inversores de forma efectiva?
-"""
-        return {
-            "type": "plan_upsell",
-            "content": upsell_message,
-            "plan": "Outreach",
-            "price": "$99/mes"
-        }
-    
-    elif action == "generate_outreach_example":
-        target_investor_id = parameters.get("target_investor_id")
-        
-        if not target_investor_id:
-            # Get first liked investor
-            try:
-                investor_query = """
-                SELECT i.id, i."Company_Name", i."Company_Description"
-                FROM investors i
-                JOIN project_saved_investors psi ON i.id = psi.investor_id
-                JOIN project_sentiments ps ON i.id = ps.entity_id
-                WHERE psi.project_id = %s AND ps.sentiment = 'like'
-                ORDER BY psi.added_at ASC
-                LIMIT 1
-                """
-                # ✅ FIXED: Use tuple for params
-                result = pd.read_sql(investor_query, engine, params=(project_id,))
-                if not result.empty:
-                    target_investor_id = result.iloc[0]['id']
-                else:
-                    return {
-                        "type": "error",
-                        "content": "No tienes inversores guardados aún. Marca algunos como 'Like' primero."
-                    }
-            except Exception as e:
-                return {
-                    "type": "error",
-                    "content": "No se pudo acceder a tus inversores guardados."
-                }
-        
-        # Generate outreach template
-        try:
-            project_data, _, _, _ = get_project_comprehensive_data(project_id)
-            result = generate_outreach_template_content(
-                target_investor_id, "investor", "email", 
-                "Genera un email profesional y personalizado", project_id
-            )
-            
-            if "error" in result:
-                return {
-                    "type": "error",
-                    "content": result["error"]
-                }
-            
-            # Update status to OUTREACH_READY
-            update_project_status(project_id, 'OUTREACH_READY')
-            
-            return {
-                "type": "outreach_template",
-                "content": result,
-                "message": "¡Aquí tienes un borrador personalizado! Puedes editarlo antes de enviarlo."
-            }
-            
-        except Exception as e:
-            print(f"❌ ERROR generating outreach: {e}")
-            return {
-                "type": "error",
-                "content": "No se pudo generar el borrador del mensaje."
-            }
-    
-    elif action == "confirm_outreach_activation":
-        return {
-            "type": "outreach_activated",
-            "content": "¡Perfecto! Sistema de outreach activado. Ahora puedes enviar mensajes profesionales a todos tus inversores guardados.",
-            "next_steps": [
-                "Revisa y personaliza cada mensaje",
-                "Programa envíos escalonados",
-                "Monitorea respuestas en tiempo real"
-            ]
-        }
-    
-    elif action == "answer_general_chat":
-        response_text = parameters.get("response_text", "¡Hola! Estoy aquí para ayudarte con tu fundraising.")
-        return {
-            "type": "text_response",
-            "content": response_text
-        }
-    
-    else:
-        return {
-            "type": "error",
-            "content": "Acción no reconocida."
-        }
-
-def generate_outreach_template_content(target_entity_id, target_entity_type, platform, user_instructions, project_id):
-    """Generate outreach template using Gemini with 0Bullshit style."""
+def get_saved_employees(project_id):
+    """Obtiene los empleados guardados de la sesión."""
     try:
-        # Get project description for context
-        project_data, _, _, _ = get_project_comprehensive_data(project_id)
+        query = """
+        SELECT e.id, e."fullName", e."headline", e."current_job_title", e."location",
+               e."linkedinUrl", e."email", e."profilePic", e."Company_Name",
+               pse.added_at, COALESCE(ps.sentiment, 'none') as sentiment
+        FROM project_saved_employees pse
+        JOIN employees e ON pse.employee_id = e.id
+        LEFT JOIN project_sentiments ps ON e.id = ps.entity_id AND ps.project_id = pse.project_id
+        WHERE pse.project_id = %s
+        ORDER BY pse.added_at DESC
+        """
         
-        # Get entity information
-        if target_entity_type == 'investor':
-            entity_query = """
+        results_df = pd.read_sql(query, engine, params=(project_id,))
+        return results_df.fillna('-').to_dict('records')
+        
+    except Exception as e:
+        print(f"❌ ERROR getting saved employees: {e}")
+        return []
+
+# ==============================================================================
+#           GENERACIÓN DE TEMPLATES CON GEMINI
+# ==============================================================================
+
+def generate_outreach_template(project_id, user_id, target_investor_id=None, target_employee_id=None, platform="email", user_instructions=""):
+    """Genera template de outreach personalizado usando Gemini."""
+    try:
+        # Obtener información del target
+        target_info = {}
+        target_type = ""
+        
+        if target_investor_id:
+            target_query = """
             SELECT "Company_Name", "Company_Description", "Investing_Stage", 
                    "Investment_Categories", "Company_Location"
             FROM investors WHERE id = %s
             """
-        else:  # employee
-            entity_query = """
-            SELECT "fullName", "headline", "Company_Name", 
-                   "location", "about", "current_job_title"
+            target_df = pd.read_sql(target_query, engine, params=(target_investor_id,))
+            if not target_df.empty:
+                target_info = target_df.iloc[0].to_dict()
+                target_type = "investor"
+        
+        elif target_employee_id:
+            target_query = """
+            SELECT "fullName", "headline", "current_job_title", "Company_Name", 
+                   "location", "linkedinUrl", "email"
             FROM employees WHERE id = %s
             """
+            target_df = pd.read_sql(target_query, engine, params=(target_employee_id,))
+            if not target_df.empty:
+                target_info = target_df.iloc[0].to_dict()
+                target_type = "employee"
         
-        # ✅ FIXED: Use tuple for params
-        entity_df = pd.read_sql(entity_query, engine, params=(target_entity_id,))
+        if not target_info:
+            return {"error": "Target not found"}
         
-        if entity_df.empty:
-            return {"error": f"Could not find {target_entity_type} with ID {target_entity_id}"}
+        # Obtener información del proyecto (contexto de la startup)
+        project_query = """
+        SELECT project_name, project_description, kpi_data
+        FROM projects WHERE id = %s
+        """
+        project_df = pd.read_sql(project_query, engine, params=(project_id,))
+        project_context = {}
+        if not project_df.empty:
+            project_context = project_df.iloc[0].to_dict()
         
-        entity_info = entity_df.iloc[0].to_dict()
-        
-        # Prepare context for template generation
-        if target_entity_type == 'investor':
-            entity_context = f"""
-            Fondo: {entity_info.get('Company_Name', 'N/A')}
-            Descripción: {entity_info.get('Company_Description', 'N/A')}
-            Etapa de Inversión: {entity_info.get('Investing_Stage', 'N/A')}
-            Categorías: {entity_info.get('Investment_Categories', 'N/A')}
-            Ubicación: {entity_info.get('Company_Location', 'N/A')}
+        # Preparar prompt para Gemini
+        if target_type == "investor":
+            target_context = f"""
+            Fondo: {target_info.get('Company_Name', 'N/A')}
+            Descripción: {target_info.get('Company_Description', 'N/A')}
+            Etapa de Inversión: {target_info.get('Investing_Stage', 'N/A')}
+            Categorías: {target_info.get('Investment_Categories', 'N/A')}
+            Ubicación: {target_info.get('Company_Location', 'N/A')}
             """
         else:
-            entity_context = f"""
-            Nombre: {entity_info.get('fullName', 'N/A')}
-            Título: {entity_info.get('current_job_title', 'N/A')}
-            Empresa: {entity_info.get('Company_Name', 'N/A')}
-            Headline: {entity_info.get('headline', 'N/A')}
-            Ubicación: {entity_info.get('location', 'N/A')}
+            target_context = f"""
+            Nombre: {target_info.get('fullName', 'N/A')}
+            Título: {target_info.get('current_job_title', 'N/A')}
+            Empresa: {target_info.get('Company_Name', 'N/A')}
+            Headline: {target_info.get('headline', 'N/A')}
+            Ubicación: {target_info.get('location', 'N/A')}
             """
         
-        # Get project KPIs for context
-        kpi_data = project_data.get('kpi_data', {})
-        if isinstance(kpi_data, str):
-            kpi_data = json.loads(kpi_data)
-        
         template_prompt = f"""
-**Tarea:** Genera un email profesional y directo (estilo "0Bullshit") para solicitar una reunión de inversión.
+**Tarea:** Genera un {platform} profesional y directo para solicitar una reunión de inversión.
 
-**Información del Fondo/Inversor:**
-{entity_context}
+**Target ({target_type}):**
+{target_context}
 
 **Mi Startup:**
-Descripción: {project_data.get('project_description', 'N/A')}
-Ingresos mensuales: {kpi_data.get('ingresos_mensuales', 'N/A')}
-Runway: {kpi_data.get('runway', 'N/A')} meses
-Margen bruto: {kpi_data.get('margen_bruto', 'N/A')}%
+Nombre: {project_context.get('project_name', 'Mi Startup')}
+Descripción: {project_context.get('project_description', 'Startup innovadora')}
+
+**Instrucciones adicionales:** {user_instructions}
 
 **Estilo "0Bullshit" - Requisitos:**
-1. **Directo y sin rodeos** - Máximo 150 palabras
-2. **Asunto claro** - Menciona la startup y el stage
+1. **Directo y sin rodeos** - Máximo 120 palabras
+2. **Asunto claro** (si es email)
 3. **Párrafo 1:** Quién soy y qué hacemos (1-2 líneas)
-4. **Párrafo 2:** Métricas clave que demuestren tracción (2-3 líneas)
-5. **Párrafo 3:** Por qué este fondo específicamente (1-2 líneas mencionando su portfolio/especialización)
-6. **Call-to-action:** Solicitud directa de 15-20 min de reunión
-7. **Tono:** Profesional pero humano, confiado sin ser arrogante
-
-**Evitar:**
-- Frases genéricas o marketing speak
-- Emails largos o con mucho texto
-- Adjuntos en el primer contacto
+4. **Párrafo 2:** Por qué este {target_type} específicamente (1-2 líneas)
+5. **Call-to-action:** Solicitud directa de 15-20 min de reunión
+6. **Tono:** Profesional pero humano, confiado sin ser arrogante
 
 **Formato de salida:**
-Asunto: [asunto aquí]
+{f"Asunto: [asunto aquí]" if platform == "email" else ""}
 
-[email body aquí]
+[mensaje aquí]
 
-Saludos,
-[Firma]
+{"Saludos," if platform == "email" else ""}
+[Nombre]
 """
 
         model = genai.GenerativeModel(MODEL_NAME)
         response = model.generate_content(template_prompt)
         template_content = response.text.strip()
         
-        # Save to database
+        # Guardar template en la base de datos
         template_id = str(uuid.uuid4())
         insert_query = """
-        INSERT INTO template_generators (id, project_id, user_id, target_investor_id, platform, conversation_history, generated_template, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO template_generators (id, project_id, user_id, target_investor_id, target_employee_id, platform, conversation_history, generated_template, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         
         params = (
             template_id,
             project_id,
-            project_data['user_id'],
-            target_entity_id,
+            user_id,
+            target_investor_id,
+            target_employee_id,
             platform,
             json.dumps([]),
             template_content,
@@ -987,8 +742,8 @@ Saludos,
             "template_id": template_id,
             "content": template_content,
             "platform": platform,
-            "target_entity_type": target_entity_type,
-            "target_info": entity_info
+            "target_type": target_type,
+            "target_info": target_info
         }
         
     except Exception as e:
@@ -996,7 +751,234 @@ Saludos,
         return {"error": "No se pudo generar la plantilla de outreach"}
 
 # ==============================================================================
-#           API ROUTES
+#           GEMINI MASTER AI - SUPERINTELIGENTE
+# ==============================================================================
+
+def get_master_ai_prompt():
+    """Prompt principal para el AI superinteligente que decide qué hacer."""
+    return """## ROL Y PERSONALIDAD
+
+Eres "0Bullshit", un supermentor de IA para startups y emprendedores. Tu misión es ayudar con fundraising, búsqueda de talento, y estrategia de negocio sin rodeos.
+
+Tu personalidad:
+- **Directo y eficiente:** Vas directo al grano
+- **Proactivo:** Sugieres acciones específicas
+- **Inteligente:** Decides automáticamente qué herramientas usar
+- **Orientado a resultados:** Siempre das next steps
+
+## HERRAMIENTAS DISPONIBLES
+
+Tienes acceso a estas funciones:
+1. **investor_search_normal:** Búsqueda estándar de inversores (50 mejores)
+2. **investor_search_deep:** Búsqueda avanzada con análisis profundo (50 mejores + insights)
+3. **employee_search:** Búsqueda de contactos en fondos de inversión (score > 44)
+4. **general_chat:** Conversación general, consejos, estrategia
+
+## LÓGICA DE DECISIÓN
+
+**USA investor_search_normal CUANDO:**
+- El usuario pida "buscar inversores", "encontrar VCs", "fundraising"
+- Mencione necesidades de capital simples
+- Búsqueda rápida de inversores
+
+**USA investor_search_deep CUANDO:**
+- El usuario pida "análisis profundo", "deep research", "investigación avanzada"
+- Mencione factores complejos como riesgo, mercado, timing
+- Necesite insights estratégicos de inversión
+
+**USA employee_search CUANDO:**
+- El usuario pida "buscar contactos", "encontrar people", "networking"
+- Quiera contactar personas específicas en fondos de inversión
+- Mencione "associates", "partners", "analysts" de VCs
+- Hable de warm introductions, contactos en fondos
+
+**USA general_chat PARA TODO LO DEMÁS:**
+- Preguntas generales de estrategia
+- Consejos de negocio
+- Dudas sobre startups
+- Conversación normal
+
+## CONTEXTO DE LA CONVERSACIÓN
+
+**Mensaje del usuario:** {user_message}
+
+## FORMATO DE RESPUESTA OBLIGATORIO
+
+Responde SIEMPRE con un único objeto JSON:
+
+```json
+{{
+  "action": "nombre_de_la_accion",
+  "reasoning": "por qué elegiste esta acción",
+  "response": "tu respuesta al usuario",
+  "parameters": {{
+    "query": "consulta procesada para la búsqueda (si aplica)"
+  }}
+}}
+```
+
+**ACCIONES DISPONIBLES:**
+- "investor_search_normal"
+- "investor_search_deep" 
+- "employee_search"
+- "general_chat"
+
+## EJEMPLOS
+
+**Usuario:** "Necesito inversores para mi fintech de pagos en México"
+**Tu respuesta:**
+```json
+{{
+  "action": "investor_search_normal",
+  "reasoning": "Solicitud directa de inversores para fintech en México, búsqueda estándar es apropiada",
+  "response": "¡Perfecto! Voy a buscar inversores especializados en fintech y pagos en México. Te traigo los 50 mejores matches.",
+  "parameters": {{
+    "query": "fintech pagos México seed series A venture capital"
+  }}
+}}
+```
+
+**Usuario:** "Busco contactos en fondos que inviertan en AI"
+**Tu respuesta:**
+```json
+{{
+  "action": "employee_search",
+  "reasoning": "Solicita contactos específicos en fondos de inversión relevantes para AI",
+  "response": "¡Genial! Primero busco los mejores fondos que invierten en AI, y luego te traigo TODOS los associates, partners y analysts que trabajan en esos fondos para networking directo.",
+  "parameters": {{
+    "query": "artificial intelligence AI machine learning deep tech venture capital"
+  }}
+}}
+```
+
+Analiza el mensaje del usuario y responde con el JSON apropiado."""
+
+def process_master_ai_request(user_message):
+    """Procesa la solicitud usando el AI master superinteligente."""
+    try:
+        # Preparar el prompt principal
+        master_prompt = get_master_ai_prompt().format(user_message=user_message)
+        
+        # Llamar a Gemini
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(master_prompt)
+        response_text = response.text.strip()
+        
+        # Extraer JSON de la respuesta
+        json_match = re.search(r'```json\s*([\s\S]+?)\s*```', response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1).strip()
+        else:
+            # Intentar encontrar JSON sin bloques de código
+            json_match = re.search(r'(\{[\s\S]*\})', response_text)
+            if json_match:
+                json_str = json_match.group(1).strip()
+            else:
+                json_str = response_text
+        
+        # Parsear JSON
+        action_data = json.loads(json_str)
+        return action_data
+        
+    except Exception as e:
+        print(f"❌ ERROR processing master AI request: {e}")
+        return {
+            "action": "general_chat",
+            "reasoning": "Error en el procesamiento, defaulting a chat general",
+            "response": "Disculpa, tuve un error procesando tu solicitud. ¿Puedes reformular tu pregunta?",
+            "parameters": {}
+        }
+
+def execute_master_ai_action(action_data):
+    """Ejecuta la acción determinada por el AI master."""
+    action = action_data.get("action")
+    parameters = action_data.get("parameters", {})
+    ai_response = action_data.get("response", "")
+    
+    if action == "investor_search_normal":
+        query = parameters.get("query", "")
+        if not query:
+            return {
+                "type": "error",
+                "content": "No se pudo generar la consulta de búsqueda."
+            }
+        
+        search_results = run_investor_search_normal(query)
+        
+        if "error" in search_results:
+            return {
+                "type": "error",
+                "content": search_results["error"]
+            }
+        
+        return {
+            "type": "investor_results_normal",
+            "ai_response": ai_response,
+            "search_results": search_results,
+            "message": f"✅ Búsqueda normal completada: {search_results['total_found']} inversores encontrados"
+        }
+    
+    elif action == "investor_search_deep":
+        query = parameters.get("query", "")
+        if not query:
+            return {
+                "type": "error",
+                "content": "No se pudo generar la consulta de búsqueda profunda."
+            }
+        
+        search_results = run_investor_search_deep(query)
+        
+        if "error" in search_results:
+            return {
+                "type": "error",
+                "content": search_results["error"]
+            }
+        
+        return {
+            "type": "investor_results_deep",
+            "ai_response": ai_response,
+            "search_results": search_results,
+            "message": f"🔍 Deep research completado: {search_results['total_found']} inversores + análisis avanzado"
+        }
+    
+    elif action == "employee_search":
+        query = parameters.get("query", "")
+        if not query:
+            return {
+                "type": "error",
+                "content": "No se pudo generar la consulta de búsqueda de empleados."
+            }
+        
+        search_results = run_employee_search(query)
+        
+        if "error" in search_results:
+            return {
+                "type": "error",
+                "content": search_results["error"]
+            }
+        
+        return {
+            "type": "employee_results",
+            "ai_response": ai_response,
+            "search_results": search_results,
+            "message": f"👥 Encontré {search_results.get('total_employees_found', 0)} contactos (score > 44) en {search_results.get('funds_with_employees', 0)} fondos relevantes"
+        }
+    
+    elif action == "general_chat":
+        return {
+            "type": "text_response",
+            "content": ai_response,
+            "ai_response": ai_response
+        }
+    
+    else:
+        return {
+            "type": "error",
+            "content": "Acción no reconocida."
+        }
+
+# ==============================================================================
+#           API ROUTES - SISTEMA DE SESIONES TEMPORALES
 # ==============================================================================
 
 print("5. Defining API routes...")
@@ -1004,86 +986,36 @@ print("5. Defining API routes...")
 @app.route('/')
 def home():
     """Main route to verify the API is working."""
-    return "<h1>0Bullshit - Enhanced Investor Finder API - OK</h1>"
+    return "<h1>🚀 0Bullshit - Backend Completo - READY! 🚀</h1>"
 
-@app.route('/auth/check', methods=['GET'])
-@require_auth
-def check_auth():
-    """Check if user is authenticated and has a project."""
+@app.route('/session/info', methods=['GET'])
+def get_session_info():
+    """Obtiene información de la sesión actual."""
     try:
-        user_id = request.user['id']
-        user_plan = request.user.get('plan', 'Free')
+        project_id, user_id = get_or_create_session_project()
         
-        # Check if user has a project
-        project = get_user_project(user_id)
-        
-        if not project:
-            return jsonify({
-                "authenticated": True,
-                "has_project": False,
-                "user": request.user,
-                "message": "No project found. Create one to continue."
-            }), 200
+        # Obtener estadísticas de la sesión
+        saved_investors = get_saved_investors(project_id)
+        saved_employees = get_saved_employees(project_id)
         
         return jsonify({
-            "authenticated": True,
-            "has_project": True,
-            "user": request.user,
-            "project": project
-        }), 200
+            "session_active": True,
+            "project_id": project_id,
+            "user_id": user_id,
+            "saved_investors_count": len(saved_investors),
+            "saved_employees_count": len(saved_employees)
+        })
         
     except Exception as e:
-        print(f"❌ ERROR in auth check: {e}")
-        return jsonify({"error": "Could not verify authentication"}), 500
-
-@app.route('/projects', methods=['POST'])
-@require_auth
-def create_project():
-    """Create a new project for the authenticated user."""
-    try:
-        data = request.json
-        project_name = data.get('project_name')
-        
-        if not project_name or len(project_name.strip()) < 3:
-            return jsonify({"error": "El nombre del proyecto debe tener al menos 3 caracteres"}), 400
-        
-        user_id = request.user['id']
-        
-        # Check if user already has a project (for Free users, limit to 1)
-        existing_project = get_user_project(user_id)
-        user_plan = request.user.get('plan', 'Free')
-        
-        if existing_project and user_plan == 'Free':
-            return jsonify({
-                "error": "Los usuarios Free solo pueden tener un proyecto. Actualiza tu plan para crear más proyectos."
-            }), 403
-        
-        # Create the project
-        project_id = create_user_project(user_id, project_name.strip())
-        
-        if not project_id:
-            return jsonify({"error": "No se pudo crear el proyecto"}), 500
-        
-        # Get the created project data
-        project_data, _, _, _ = get_project_comprehensive_data(project_id)
-        
-        return jsonify({
-            "message": "Proyecto creado exitosamente",
-            "project": project_data
-        }), 201
-        
-    except Exception as e:
-        print(f"❌ ERROR creating project: {e}")
-        return jsonify({"error": "No se pudo crear el proyecto"}), 500
+        print(f"❌ ERROR getting session info: {e}")
+        return jsonify({"error": "Could not get session info"}), 500
 
 @app.route('/chat', methods=['POST'])
-@require_auth
-def zero_bullshit_chat_endpoint():
-    """Main 0Bullshit conversational endpoint."""
-    print("\n--- Request /chat (0Bullshit) ---")
+def master_chat_endpoint():
+    """Endpoint principal para el chat con AI superinteligente."""
+    print("\n--- Request /chat (Master AI) ---")
     data = request.json
     user_message = data.get('message')
-    project_id = data.get('project_id')
 
     if not user_message:
         return jsonify({"error": "message is required"}), 400
@@ -1091,175 +1023,240 @@ def zero_bullshit_chat_endpoint():
     print(f"  -> Message: '{user_message[:50]}...'")
 
     try:
-        user_id = request.user['id']
+        # Asegurarse de que hay una sesión activa
+        project_id, user_id = get_or_create_session_project()
         
-        # If no project_id provided, get user's current project
-        if not project_id:
-            project = get_user_project(user_id)
-            if not project:
-                return jsonify({
-                    "type": "need_project",
-                    "content": "Para continuar, necesitas crear un proyecto. Ve a la sección 'Crear Proyecto' y dale un nombre a tu startup."
-                }), 200
-            project_id = project['id']
+        # Procesar la solicitud con el AI master
+        action_data = process_master_ai_request(user_message)
         
-        # Verify project belongs to user
-        project_data, _, _, _ = get_project_comprehensive_data(project_id)
-        if not project_data or project_data['user_id'] != user_id:
-            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
-
-        # Process the 0Bullshit conversational request
-        action_data = process_zero_bullshit_request(project_id, user_message)
+        # Ejecutar la acción determinada
+        result = execute_master_ai_action(action_data)
         
-        # Execute the determined action
-        result = execute_zero_bullshit_action(action_data, project_id)
+        # Agregar info de sesión al resultado
+        result["session_info"] = {
+            "project_id": project_id,
+            "user_id": user_id
+        }
         
-        # Save conversation to database
-        save_conversation_message(project_id, user_message, result.get("content", ""))
-        
-        print("--- Request /chat (0Bullshit) completed ---")
+        print("--- Request /chat (Master AI) completed ---")
         return jsonify(result)
         
     except Exception as e:
-        print(f"❌ ERROR in 0Bullshit chat endpoint: {e}")
+        print(f"❌ ERROR in master chat endpoint: {e}")
         return jsonify({
             "type": "error",
             "content": "Hubo un error procesando tu solicitud. Inténtalo de nuevo."
         }), 500
 
-@app.route('/projects/<project_id>/status', methods=['PUT'])
-@require_auth
-def update_project_status_endpoint(project_id):
-    """Update project status."""
+@app.route('/search/investors', methods=['POST'])
+def search_investors_endpoint():
+    """Endpoint directo para búsqueda de inversores."""
+    print("\n--- Request /search/investors ---")
+    data = request.json
+    query = data.get('query')
+    search_type = data.get('type', 'normal')  # 'normal' o 'deep'
+
+    if not query:
+        return jsonify({"error": "query is required"}), 400
+
+    print(f"  -> Query: '{query[:50]}...', Type: {search_type}")
+
     try:
-        # Verify project belongs to user
-        project_data, _, _, _ = get_project_comprehensive_data(project_id)
-        if not project_data or project_data['user_id'] != request.user['id']:
-            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
+        project_id, user_id = get_or_create_session_project()
         
-        data = request.json
-        new_status = data.get('status')
+        if search_type == 'deep':
+            results = run_investor_search_deep(query)
+        else:
+            results = run_investor_search_normal(query)
         
-        if not new_status:
-            return jsonify({"error": "status is required"}), 400
+        results["session_info"] = {"project_id": project_id, "user_id": user_id}
         
-        update_project_status(project_id, new_status)
-        return jsonify({"message": f"Project status updated to {new_status}"})
+        print("--- Request /search/investors completed ---")
+        return jsonify(results)
         
     except Exception as e:
-        print(f"❌ ERROR updating project status: {e}")
-        return jsonify({"error": "Could not update project status"}), 500
+        print(f"❌ ERROR in investor search endpoint: {e}")
+        return jsonify({"error": f"Error en búsqueda de inversores: {e}"}), 500
 
-@app.route('/projects/<project_id>/kpi', methods=['PUT'])
-@require_auth
-def update_project_kpi_endpoint(project_id):
-    """Update project KPI data."""
+@app.route('/search/employees', methods=['POST'])
+def search_employees_endpoint():
+    """Endpoint directo para búsqueda de empleados en fondos de inversión."""
+    print("\n--- Request /search/employees ---")
+    data = request.json
+    query = data.get('query')
+    search_type = data.get('type', 'normal')  # 'normal' o 'deep'
+
+    if not query:
+        return jsonify({"error": "query is required"}), 400
+
+    print(f"  -> Query: '{query[:50]}...', Type: {search_type}")
+
     try:
-        # Verify project belongs to user
-        project_data, _, _, _ = get_project_comprehensive_data(project_id)
-        if not project_data or project_data['user_id'] != request.user['id']:
-            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
+        project_id, user_id = get_or_create_session_project()
         
-        data = request.json
-        kpi_data = data.get('kpi_data')
+        results = run_employee_search(query, search_type)
+        results["session_info"] = {"project_id": project_id, "user_id": user_id}
         
-        if not kpi_data:
-            return jsonify({"error": "kpi_data is required"}), 400
-        
-        update_project_kpi_data(project_id, kpi_data)
-        return jsonify({"message": "KPI data updated successfully"})
+        print("--- Request /search/employees completed ---")
+        return jsonify(results)
         
     except Exception as e:
-        print(f"❌ ERROR updating KPI data: {e}")
-        return jsonify({"error": "Could not update KPI data"}), 500
+        print(f"❌ ERROR in employee search endpoint: {e}")
+        return jsonify({"error": f"Error en búsqueda de empleados: {e}"}), 500
 
-@app.route('/projects/<project_id>', methods=['GET'])
-@require_auth
-def get_project_endpoint(project_id):
-    """Get comprehensive project data."""
+@app.route('/save/investor', methods=['POST'])
+def save_investor_endpoint():
+    """Guarda un inversor en la sesión."""
     try:
-        project_data, chat_history, saved_investors_count, user_plan = get_project_comprehensive_data(project_id)
+        data = request.json
+        investor_id = data.get('investor_id')
         
-        if not project_data:
-            return jsonify({"error": "Project not found"}), 404
+        if not investor_id:
+            return jsonify({"error": "investor_id is required"}), 400
         
-        # Verify project belongs to user
-        if project_data['user_id'] != request.user['id']:
-            return jsonify({"error": "No tienes permisos para acceder a este proyecto"}), 403
+        project_id, user_id = get_or_create_session_project()
+        
+        success = save_investor_to_session(project_id, user_id, investor_id)
+        
+        if success:
+            return jsonify({"message": "Investor saved successfully"})
+        else:
+            return jsonify({"error": "Failed to save investor"}), 500
+            
+    except Exception as e:
+        print(f"❌ ERROR saving investor: {e}")
+        return jsonify({"error": "Could not save investor"}), 500
+
+@app.route('/save/employee', methods=['POST'])
+def save_employee_endpoint():
+    """Guarda un empleado en la sesión."""
+    try:
+        data = request.json
+        employee_id = data.get('employee_id')
+        
+        if not employee_id:
+            return jsonify({"error": "employee_id is required"}), 400
+        
+        project_id, user_id = get_or_create_session_project()
+        
+        success = save_employee_to_session(project_id, user_id, employee_id)
+        
+        if success:
+            return jsonify({"message": "Employee saved successfully"})
+        else:
+            return jsonify({"error": "Failed to save employee"}), 500
+            
+    except Exception as e:
+        print(f"❌ ERROR saving employee: {e}")
+        return jsonify({"error": "Could not save employee"}), 500
+
+@app.route('/sentiment', methods=['POST'])
+def save_sentiment_endpoint():
+    """Guarda el sentiment (like/dislike) de una entidad."""
+    try:
+        data = request.json
+        entity_id = data.get('entity_id')
+        entity_type = data.get('entity_type')  # 'investor' o 'employee'
+        sentiment = data.get('sentiment')  # 'like' o 'dislike'
+        
+        if not all([entity_id, entity_type, sentiment]):
+            return jsonify({"error": "entity_id, entity_type, and sentiment are required"}), 400
+        
+        project_id, user_id = get_or_create_session_project()
+        
+        # Guardar en tabla correspondiente si es like
+        if sentiment == 'like':
+            if entity_type == 'investor':
+                save_investor_to_session(project_id, user_id, entity_id)
+            elif entity_type == 'employee':
+                save_employee_to_session(project_id, user_id, entity_id)
+        
+        # Guardar sentiment
+        success = save_sentiment(project_id, user_id, entity_id, entity_type, sentiment)
+        
+        if success:
+            return jsonify({"message": f"Sentiment '{sentiment}' saved successfully"})
+        else:
+            return jsonify({"error": "Failed to save sentiment"}), 500
+            
+    except Exception as e:
+        print(f"❌ ERROR saving sentiment: {e}")
+        return jsonify({"error": "Could not save sentiment"}), 500
+
+@app.route('/saved/investors', methods=['GET'])
+def get_saved_investors_endpoint():
+    """Obtiene los inversores guardados de la sesión."""
+    try:
+        project_id, user_id = get_or_create_session_project()
+        
+        saved_investors = get_saved_investors(project_id)
         
         return jsonify({
-            "project": project_data,
-            "chat_history": chat_history,
-            "saved_investors_count": saved_investors_count,
-            "user_plan": user_plan
+            "saved_investors": saved_investors,
+            "total_count": len(saved_investors)
         })
         
     except Exception as e:
-        print(f"❌ ERROR getting project data: {e}")
-        return jsonify({"error": "Could not retrieve project data"}), 500
-
-@app.route('/projects/<project_id>/saved-investors', methods=['GET'])
-@require_auth
-def get_saved_investors_endpoint(project_id):
-    """Get saved investors with sentiment for a project."""
-    try:
-        # Verify project belongs to user
-        project_data, _, _, _ = get_project_comprehensive_data(project_id)
-        if not project_data or project_data['user_id'] != request.user['id']:
-            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
-        
-        query = """
-        SELECT i.id, i."Company_Name", i."Company_Description", i."Investing_Stage",
-               i."Company_Location", i."Investment_Categories", i."Company_Email",
-               i."Company_Phone", i."Company_Linkedin", i."Company_Website",
-               psi.added_at, ps.sentiment
-        FROM project_saved_investors psi
-        JOIN investors i ON psi.investor_id = i.id
-        LEFT JOIN project_sentiments ps ON i.id = ps.entity_id AND ps.project_id = psi.project_id
-        WHERE psi.project_id = %s
-        ORDER BY psi.added_at DESC
-        """
-        
-        # ✅ FIXED: Use tuple for params
-        results_df = pd.read_sql(query, engine, params=(project_id,))
-        saved_investors = results_df.fillna('-').to_dict('records')
-        
-        return jsonify({"saved_investors": saved_investors})
-        
-    except Exception as e:
         print(f"❌ ERROR getting saved investors: {e}")
-        return jsonify({"error": "Could not retrieve saved investors"}), 500
+        return jsonify({"error": "Could not get saved investors"}), 500
 
-@app.route('/projects/<project_id>/templates', methods=['GET'])
-@require_auth
-def get_project_templates_endpoint(project_id):
-    """Get generated templates for a project."""
+@app.route('/saved/employees', methods=['GET'])
+def get_saved_employees_endpoint():
+    """Obtiene los empleados guardados de la sesión."""
     try:
-        # Verify project belongs to user
-        project_data, _, _, _ = get_project_comprehensive_data(project_id)
-        if not project_data or project_data['user_id'] != request.user['id']:
-            return jsonify({"error": "Proyecto no encontrado o no tienes permisos"}), 404
+        project_id, user_id = get_or_create_session_project()
         
-        query = """
-        SELECT tg.id, tg.target_investor_id, tg.platform, tg.generated_template, 
-               tg.created_at, i."Company_Name" as target_name
-        FROM template_generators tg
-        LEFT JOIN investors i ON tg.target_investor_id = i.id
-        WHERE tg.project_id = %s
-        ORDER BY tg.created_at DESC
-        """
+        saved_employees = get_saved_employees(project_id)
         
-        # ✅ FIXED: Use tuple for params
-        results_df = pd.read_sql(query, engine, params=(project_id,))
-        templates = results_df.fillna('-').to_dict('records')
-        
-        return jsonify({"templates": templates})
+        return jsonify({
+            "saved_employees": saved_employees,
+            "total_count": len(saved_employees)
+        })
         
     except Exception as e:
-        print(f"❌ ERROR getting templates: {e}")
-        return jsonify({"error": "Could not retrieve templates"}), 500
+        print(f"❌ ERROR getting saved employees: {e}")
+        return jsonify({"error": "Could not get saved employees"}), 500
 
-# Legacy endpoint for backward compatibility
+@app.route('/generate/template', methods=['POST'])
+def generate_template_endpoint():
+    """Genera template de outreach personalizado."""
+    try:
+        data = request.json
+        target_investor_id = data.get('target_investor_id')
+        target_employee_id = data.get('target_employee_id')
+        platform = data.get('platform', 'email')  # 'email' o 'linkedin'
+        user_instructions = data.get('instructions', '')
+        
+        if not target_investor_id and not target_employee_id:
+            return jsonify({"error": "target_investor_id or target_employee_id is required"}), 400
+        
+        project_id, user_id = get_or_create_session_project()
+        
+        result = generate_outreach_template(
+            project_id, user_id, target_investor_id, target_employee_id, platform, user_instructions
+        )
+        
+        if "error" in result:
+            return jsonify(result), 500
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        print(f"❌ ERROR generating template: {e}")
+        return jsonify({"error": "Could not generate template"}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "database": "connected" if engine else "disconnected",
+        "gemini": "configured" if API_KEY else "not_configured",
+        "session_support": True
+    })
+
+# Endpoint legacy para compatibilidad
 @app.route('/find_investors', methods=['POST'])
 def find_investors_legacy_endpoint():
     """Legacy endpoint for backward compatibility."""
@@ -1273,15 +1270,22 @@ def find_investors_legacy_endpoint():
 
     print(f"  -> Query: '{user_query[:50]}...', Deep: {is_deep}.")
     
-    # Create mock project data for legacy support
-    mock_project_data = {
-        'project_description': user_query,
-        'kpi_data': {}
-    }
-    
-    results = run_investor_search(mock_project_data)
-    print("--- Request /find_investors (Legacy) completed ---")
-    return jsonify(results)
+    try:
+        project_id, user_id = get_or_create_session_project()
+        
+        if is_deep:
+            results = run_investor_search_deep(user_query)
+        else:
+            results = run_investor_search_normal(user_query)
+        
+        results["session_info"] = {"project_id": project_id, "user_id": user_id}
+        
+        print("--- Request /find_investors (Legacy) completed ---")
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"❌ ERROR in legacy endpoint: {e}")
+        return jsonify({"error": f"Error in search: {e}"}), 500
 
 # ==============================================================================
 #           EXECUTION
@@ -1290,4 +1294,9 @@ def find_investors_legacy_endpoint():
 if __name__ == '__main__':
     print("Starting Flask server for local testing...")
     print("🚀 0Bullshit Enhanced Backend READY! 🚀")
+    print("🔓 MODO ABIERTO - Sesiones temporales activadas")
+    print("🤖 AI Superinteligente activado")
+    print("💼 Algoritmos de matching: Inversores + Empleados (score > 44)")
+    print("👍 Sistema completo de like/dislike")
+    print("📧 Generación de templates con Gemini")
     app.run(host='0.0.0.0', port=8080, debug=True)
