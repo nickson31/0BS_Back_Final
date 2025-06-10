@@ -519,7 +519,7 @@ def save_investor_to_session(project_id, user_id, investor_id):
         params = (project_id, investor_id, datetime.now())
         
         with engine.connect() as conn:
-            conn.execute(text(insert_query), tuple(params))
+            conn.execute(text(insert_query), params)
             conn.commit()
         
         return True
@@ -538,7 +538,7 @@ def save_employee_to_session(project_id, user_id, employee_id):
         params = (project_id, employee_id, datetime.now())
         
         with engine.connect() as conn:
-            conn.execute(text(insert_query), tuple(params))
+            conn.execute(text(insert_query), params)
             conn.commit()
         
         return True
@@ -567,7 +567,7 @@ def save_sentiment(project_id, user_id, entity_id, entity_type, sentiment):
         )
         
         with engine.connect() as conn:
-            conn.execute(text(insert_query), tuple(params))
+            conn.execute(text(insert_query), params)
             conn.commit()
         
         return True
