@@ -129,8 +129,8 @@ def get_or_create_session_project():
             )
             
             with engine.connect() as conn:
-                conn.execute(text(insert_user_query), user_params)
-                conn.execute(text(insert_project_query), project_params)
+                conn.execute(text(insert_user_query), tuple(user_params))
+                conn.execute(text(insert_project_query), tuple(project_params))
                 conn.commit()
             
             session['project_id'] = project_id
@@ -404,7 +404,7 @@ def find_employees_from_investors(investor_results, search_type="normal"):
         """
         
         # Preparar parámetros para la consulta (agregar % para búsqueda parcial)
-        params = [f"%{company}%" for company in investor_companies]
+        params = tuple(f"%{company}%" for company in investor_companies)
         
         employees_df = pd.read_sql(sql_query, engine, params=params)
         
@@ -519,7 +519,7 @@ def save_investor_to_session(project_id, user_id, investor_id):
         params = (project_id, investor_id, datetime.now())
         
         with engine.connect() as conn:
-            conn.execute(text(insert_query), params)
+            conn.execute(text(insert_query), tuple(params))
             conn.commit()
         
         return True
@@ -538,7 +538,7 @@ def save_employee_to_session(project_id, user_id, employee_id):
         params = (project_id, employee_id, datetime.now())
         
         with engine.connect() as conn:
-            conn.execute(text(insert_query), params)
+            conn.execute(text(insert_query), tuple(params))
             conn.commit()
         
         return True
@@ -567,7 +567,7 @@ def save_sentiment(project_id, user_id, entity_id, entity_type, sentiment):
         )
         
         with engine.connect() as conn:
-            conn.execute(text(insert_query), params)
+            conn.execute(text(insert_query), tuple(params))
             conn.commit()
         
         return True
@@ -735,7 +735,7 @@ Descripción: {project_context.get('project_description', 'Startup innovadora')}
         )
         
         with engine.connect() as conn:
-            conn.execute(text(insert_query), params)
+            conn.execute(text(insert_query), tuple(params))
             conn.commit()
         
         return {
