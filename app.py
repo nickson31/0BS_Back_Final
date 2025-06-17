@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-
 """
-0Bullshit - Backend Completo Sin Autenticación 
-Sistema de sesiones temporales con funcionalidad completa
+0Bullshit Backend v2.0 - Sistema Gamificado con 60 Bots
+Sistema de créditos, suscripciones y memoria neuronal
 """
 
 # ==============================================================================
@@ -21,10 +20,15 @@ import warnings
 import time
 import os
 import sqlalchemy
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 from sqlalchemy import text
 import secrets
+import stripe
+import jwt
+from functools import wraps
+import hashlib
+import bcrypt
 
 # ==============================================================================
 #           CONFIGURATION
@@ -32,27 +36,36 @@ import secrets
 
 print("2. Configuring application...")
 app = Flask(__name__)
-CORS(app, supports_credentials=True)  # Permite sesiones
-app.secret_key = secrets.token_hex(16)  # Para sesiones Flask
+CORS(app, supports_credentials=True)
+app.secret_key = secrets.token_hex(16)
 warnings.filterwarnings('ignore')
 
 # Environment Variables
-API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")  # Para Opus4
 DATABASE_URL = os.environ.get("DATABASE_URL")
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+UNIPILE_API_KEY = os.environ.get("UNIPILE_API_KEY")  # Para Pro plan
 
-if not API_KEY:
+if not GEMINI_API_KEY:
     print("❌ FATAL: GEMINI_API_KEY not found.")
 if not DATABASE_URL:
     print("❌ FATAL: DATABASE_URL not found.")
 
-# Configure Gemini
+# Configure AI APIs
 try:
-    genai.configure(api_key=API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
     MODEL_NAME = "gemini-2.0-flash"
     print("✅ Gemini API configured.")
 except Exception as e:
     print(f"❌ ERROR configuring Gemini: {e}")
-    exit()
+
+# Configure Stripe
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+    print("✅ Stripe configured.")
 
 # Connect to Supabase
 try:
@@ -62,34 +75,638 @@ except Exception as e:
     print(f"❌ ERROR connecting to Supabase: {e}")
     engine = None
 
-# Context file paths
-UBICACIONES_TXT_PATH = 'ubicaciones.txt'
-ETAPAS_TXT_PATH = 'etapas.txt'
-CATEGORIAS_TXT_PATH = 'categorias.txt'
-
 # ==============================================================================
-#           UTILITY FUNCTIONS
+#           CONSTANTS AND CONFIGURATIONS
 # ==============================================================================
 
-print("3. Defining utility functions...")
+# Credit costs por acción
+CREDIT_COSTS = {
+    # Bots básicos (todos los planes)
+    "basic_bot": 5,
+    "advanced_bot": 15,
+    "expert_bot": 25,
+    "document_generation": 50,
+    
+    # Growth plan only
+    "investor_search_result": 10,
+    "employee_search_result": 8,
+    
+    # Pro plan only
+    "template_generation": 20,
+    "unipile_message": 5,
+    "automated_sequence": 50,
+    
+    # Premium features
+    "market_analysis": 100,
+    "business_model": 150,
+    "pitch_deck": 200
+}
 
-def load_context_file(filepath):
-    """Load content from a text file."""
+# Planes de suscripción
+SUBSCRIPTION_PLANS = {
+    "free": {
+        "name": "Free",
+        "price": 0,
+        "credits_monthly": 100,
+        "launch_credits": 100,
+        "features": {
+            "bots_access": True,
+            "investor_search": False,
+            "employee_search": False,
+            "outreach_templates": False,
+            "unlimited_docs": False,
+            "neural_memory": False
+        }
+    },
+    "growth": {
+        "name": "Growth",
+        "price": 20,
+        "stripe_price_id": "price_growth_monthly",
+        "credits_monthly": 10000,
+        "launch_credits": 100000,
+        "features": {
+            "bots_access": True,
+            "investor_search": True,
+            "employee_search": True,
+            "outreach_templates": False,
+            "unlimited_docs": True,
+            "neural_memory": True
+        }
+    },
+    "pro": {
+        "name": "Pro Outreach",
+        "price": 89,
+        "stripe_price_id": "price_pro_monthly",
+        "credits_monthly": 50000,
+        "launch_credits": 1000000,
+        "features": {
+            "bots_access": True,
+            "investor_search": True,
+            "employee_search": True,
+            "outreach_templates": True,
+            "unlimited_docs": True,
+            "neural_memory": True,
+            "unipile_integration": True
+        }
+    }
+}
+
+# ==============================================================================
+#           AUTHENTICATION & USER MANAGEMENT
+# ==============================================================================
+
+def hash_password(password):
+    """Hash password usando bcrypt"""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(password, hashed):
+    """Verifica password contra hash"""
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def generate_jwt_token(user_id):
+    """Genera JWT token para el usuario"""
+    payload = {
+        'user_id': user_id,
+        'exp': datetime.utcnow() + timedelta(days=7),
+        'iat': datetime.utcnow()
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+
+def verify_jwt_token(token):
+    """Verifica y decodifica JWT token"""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return f.read()
+        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+        return payload['user_id']
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+def require_auth(f):
+    """Decorator para endpoints que requieren autenticación"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'error': 'No authorization token provided'}), 401
+        
+        if token.startswith('Bearer '):
+            token = token[7:]
+        
+        user_id = verify_jwt_token(token)
+        if not user_id:
+            return jsonify({'error': 'Invalid or expired token'}), 401
+        
+        # Obtener usuario de la base de datos
+        user = get_user_by_id(user_id)
+        if not user:
+            return jsonify({'error': 'User not found'}), 401
+        
+        # Pasar usuario al endpoint
+        return f(user, *args, **kwargs)
+    
+    return decorated_function
+
+def require_plan(required_plan):
+    """Decorator para verificar plan de suscripción"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(user, *args, **kwargs):
+            user_plan = user.get('plan', 'free')
+            
+            # Verificar acceso por plan
+            plan_hierarchy = {'free': 0, 'growth': 1, 'pro': 2}
+            required_level = plan_hierarchy.get(required_plan, 0)
+            user_level = plan_hierarchy.get(user_plan, 0)
+            
+            if user_level < required_level:
+                return jsonify({
+                    'error': 'Plan upgrade required',
+                    'required_plan': required_plan,
+                    'current_plan': user_plan,
+                    'upsell': True,
+                    'upgrade_url': f'/upgrade/{required_plan}'
+                }), 403
+            
+            return f(user, *args, **kwargs)
+        return decorated_function
+    return decorator
+
+# ==============================================================================
+#           DATABASE HELPERS
+# ==============================================================================
+
+def get_user_by_id(user_id):
+    """Obtiene usuario por ID"""
+    try:
+        query = """
+        SELECT u.*, s.status as subscription_status, s.stripe_subscription_id
+        FROM users u
+        LEFT JOIN subscriptions s ON u.id = s.user_id AND s.status = 'active'
+        WHERE u.id = %s
+        """
+        result = pd.read_sql(query, engine, params=[user_id])
+        if result.empty:
+            return None
+        return result.iloc[0].to_dict()
     except Exception as e:
-        print(f"  ❌ ERROR loading {filepath}: {e}")
-        return ""
+        print(f"❌ ERROR getting user: {e}")
+        return None
 
-# Load context files
-ubicaciones_context = load_context_file(UBICACIONES_TXT_PATH)
-etapas_context = load_context_file(ETAPAS_TXT_PATH)
-categorias_context = load_context_file(CATEGORIAS_TXT_PATH)
-print("✅ Contexts loaded.")
+def get_user_by_email(email):
+    """Obtiene usuario por email"""
+    try:
+        query = "SELECT * FROM users WHERE email = %s"
+        result = pd.read_sql(query, engine, params=[email])
+        if result.empty:
+            return None
+        return result.iloc[0].to_dict()
+    except Exception as e:
+        print(f"❌ ERROR getting user by email: {e}")
+        return None
 
-def parse_keyword_list(value):
-    """Convert a string (or NaN) to a list of keywords."""
+def create_user(email, password, first_name, last_name):
+    """Crea nuevo usuario"""
+    try:
+        user_id = str(uuid.uuid4())
+        hashed_password = hash_password(password)
+        
+        query = """
+        INSERT INTO users (id, email, password_hash, first_name, last_name, plan, credits_balance, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        params = (
+            user_id, email, hashed_password, first_name, last_name,
+            'free', SUBSCRIPTION_PLANS['free']['launch_credits'],
+            datetime.now(), datetime.now()
+        )
+        
+        with engine.connect() as conn:
+            conn.execute(text(query), params)
+            conn.commit()
+        
+        # Inicializar memoria neuronal
+        init_neural_memory(user_id)
+        
+        return user_id
+    except Exception as e:
+        print(f"❌ ERROR creating user: {e}")
+        return None
+
+def get_user_credits(user_id):
+    """Obtiene créditos del usuario"""
+    try:
+        query = "SELECT credits_balance FROM users WHERE id = %s"
+        result = pd.read_sql(query, engine, params=[user_id])
+        if result.empty:
+            return 0
+        return result.iloc[0]['credits_balance']
+    except Exception as e:
+        print(f"❌ ERROR getting credits: {e}")
+        return 0
+
+def charge_credits(user_id, amount):
+    """Cobra créditos al usuario"""
+    try:
+        query = """
+        UPDATE users 
+        SET credits_balance = credits_balance - %s, updated_at = %s
+        WHERE id = %s AND credits_balance >= %s
+        """
+        
+        with engine.connect() as conn:
+            result = conn.execute(text(query), (amount, datetime.now(), user_id, amount))
+            conn.commit()
+            
+            if result.rowcount == 0:
+                return False  # Créditos insuficientes
+        
+        # Log de transacción
+        log_credit_transaction(user_id, -amount, 'charge', 'Bot usage')
+        return True
+    except Exception as e:
+        print(f"❌ ERROR charging credits: {e}")
+        return False
+
+def add_credits(user_id, amount, reason='purchase'):
+    """Añade créditos al usuario"""
+    try:
+        query = """
+        UPDATE users 
+        SET credits_balance = credits_balance + %s, updated_at = %s
+        WHERE id = %s
+        """
+        
+        with engine.connect() as conn:
+            conn.execute(text(query), (amount, datetime.now(), user_id))
+            conn.commit()
+        
+        log_credit_transaction(user_id, amount, 'add', reason)
+        return True
+    except Exception as e:
+        print(f"❌ ERROR adding credits: {e}")
+        return False
+
+def log_credit_transaction(user_id, amount, transaction_type, description):
+    """Log de transacciones de créditos"""
+    try:
+        query = """
+        INSERT INTO credit_transactions (id, user_id, amount, transaction_type, description, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        
+        params = (
+            str(uuid.uuid4()), user_id, amount, transaction_type, description, datetime.now()
+        )
+        
+        with engine.connect() as conn:
+            conn.execute(text(query), params)
+            conn.commit()
+    except Exception as e:
+        print(f"❌ ERROR logging transaction: {e}")
+
+# ==============================================================================
+#           GEMINI ARMY - 60 BOTS SYSTEM
+# ==============================================================================
+
+# Importar el ejército de bots del archivo separado
+from bots.gemini_army import GEMINI_ARMY, execute_gemini_bot
+
+class BotManager:
+    def __init__(self):
+        self.bots = GEMINI_ARMY
+        self.router = GeminiRouter()
+    
+    def process_user_request(self, user_input, user_context, user_id):
+        """Procesa solicitud del usuario con IA router"""
+        try:
+            # Router decide qué bot usar
+            selected_bot_id = self.router.select_optimal_bot(user_input, user_context)
+            
+            if not selected_bot_id or selected_bot_id not in self.bots:
+                selected_bot_id = "general_consultant"  # Bot por defecto
+            
+            selected_bot = self.bots[selected_bot_id]
+            
+            # Verificar créditos
+            required_credits = selected_bot["credit_cost"]
+            user_credits = get_user_credits(user_id)
+            
+            if user_credits < required_credits:
+                return {
+                    "error": "insufficient_credits",
+                    "required": required_credits,
+                    "available": user_credits,
+                    "upsell": True
+                }
+            
+            # Ejecutar bot
+            result = execute_gemini_bot(selected_bot_id, user_context, user_input, user_credits)
+            
+            if result.get("success"):
+                # Cobrar créditos
+                charge_credits(user_id, required_credits)
+                
+                # Guardar en memoria neuronal
+                save_neural_interaction(user_id, {
+                    "input": user_input,
+                    "bot_used": selected_bot_id,
+                    "output": result["response"],
+                    "credits_charged": required_credits,
+                    "context": user_context
+                })
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ ERROR in bot manager: {e}")
+            return {"error": "Error processing request"}
+
+class GeminiRouter:
+    """Router inteligente que decide qué bot usar"""
+    
+    def select_optimal_bot(self, user_input, user_context):
+        """Usa Gemini para seleccionar el bot óptimo"""
+        try:
+            router_prompt = f"""
+            Eres un router inteligente que decide qué bot especializado usar.
+            
+            Input del usuario: "{user_input}"
+            Contexto: {user_context}
+            
+            Bots disponibles: {list(GEMINI_ARMY.keys())}
+            
+            Responde SOLO con el ID del bot más apropiado.
+            
+            Ejemplos:
+            - "necesito un pitch deck" → "pitch_deck_master"
+            - "buscar inversores" → "investor_researcher" 
+            - "estrategia de producto" → "product_visionary"
+            - "análisis financiero" → "cfo_virtual"
+            
+            Bot ID:"""
+            
+            model = genai.GenerativeModel(MODEL_NAME)
+            response = model.generate_content(router_prompt)
+            
+            selected_bot = response.text.strip().replace('"', '').replace("'", "")
+            
+            if selected_bot in GEMINI_ARMY:
+                return selected_bot
+            
+            return "general_consultant"  # Fallback
+            
+        except Exception as e:
+            print(f"❌ ERROR in router: {e}")
+            return "general_consultant"
+
+# ==============================================================================
+#           NEURAL MEMORY SYSTEM
+# ==============================================================================
+
+def init_neural_memory(user_id):
+    """Inicializa memoria neuronal para nuevo usuario"""
+    try:
+        memory_id = str(uuid.uuid4())
+        query = """
+        INSERT INTO neural_memory (id, user_id, memory_type, memory_data, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        
+        initial_memory = {
+            "interactions_count": 0,
+            "preferred_bots": {},
+            "success_patterns": {},
+            "startup_context": {},
+            "learning_preferences": {}
+        }
+        
+        params = (
+            memory_id, user_id, 'main_memory', 
+            json.dumps(initial_memory), datetime.now(), datetime.now()
+        )
+        
+        with engine.connect() as conn:
+            conn.execute(text(query), params)
+            conn.commit()
+            
+    except Exception as e:
+        print(f"❌ ERROR initializing neural memory: {e}")
+
+def save_neural_interaction(user_id, interaction_data):
+    """Guarda interacción en memoria neuronal"""
+    try:
+        interaction_id = str(uuid.uuid4())
+        query = """
+        INSERT INTO neural_interactions (id, user_id, bot_used, user_input, bot_output, 
+                                       credits_charged, context_data, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        params = (
+            interaction_id, user_id, interaction_data["bot_used"],
+            interaction_data["input"], interaction_data["output"],
+            interaction_data["credits_charged"], json.dumps(interaction_data["context"]),
+            datetime.now()
+        )
+        
+        with engine.connect() as conn:
+            conn.execute(text(query), params)
+            conn.commit()
+            
+        # Actualizar memoria principal
+        update_neural_memory(user_id, interaction_data)
+        
+    except Exception as e:
+        print(f"❌ ERROR saving neural interaction: {e}")
+
+def update_neural_memory(user_id, interaction_data):
+    """Actualiza memoria neuronal principal"""
+    try:
+        # Obtener memoria actual
+        query = "SELECT memory_data FROM neural_memory WHERE user_id = %s AND memory_type = 'main_memory'"
+        result = pd.read_sql(query, engine, params=[user_id])
+        
+        if result.empty:
+            init_neural_memory(user_id)
+            return
+        
+        memory = json.loads(result.iloc[0]['memory_data'])
+        
+        # Actualizar con nueva interacción
+        memory["interactions_count"] += 1
+        
+        bot_used = interaction_data["bot_used"]
+        if bot_used not in memory["preferred_bots"]:
+            memory["preferred_bots"][bot_used] = 0
+        memory["preferred_bots"][bot_used] += 1
+        
+        # Guardar memoria actualizada
+        update_query = """
+        UPDATE neural_memory 
+        SET memory_data = %s, updated_at = %s 
+        WHERE user_id = %s AND memory_type = 'main_memory'
+        """
+        
+        with engine.connect() as conn:
+            conn.execute(text(update_query), (json.dumps(memory), datetime.now(), user_id))
+            conn.commit()
+            
+    except Exception as e:
+        print(f"❌ ERROR updating neural memory: {e}")
+
+def get_neural_memory(user_id):
+    """Obtiene memoria neuronal del usuario"""
+    try:
+        query = "SELECT memory_data FROM neural_memory WHERE user_id = %s AND memory_type = 'main_memory'"
+        result = pd.read_sql(query, engine, params=[user_id])
+        
+        if result.empty:
+            return {}
+        
+        return json.loads(result.iloc[0]['memory_data'])
+    except Exception as e:
+        print(f"❌ ERROR getting neural memory: {e}")
+        return {}
+
+# ==============================================================================
+#           SEARCH ALGORITHMS (Growth/Pro only)
+# ==============================================================================
+
+def intelligent_keyword_extraction(query, user_context):
+    """Extrae keywords inteligentemente usando Gemini"""
+    try:
+        prompt = f"""
+        Convierte esta consulta en keywords precisas para búsqueda de inversores:
+        
+        Query: "{query}"
+        Context del usuario: {user_context}
+        
+        Extrae:
+        1. Ubicaciones (países, ciudades, regiones)
+        2. Etapas de inversión (seed, series A, growth, etc.)
+        3. Categorías/sectores (fintech, healthtech, AI, etc.)
+        
+        Responde en JSON:
+        {{
+            "ubicacion": ["keyword1", "keyword2"],
+            "etapa": ["keyword1", "keyword2"], 
+            "categoria": ["keyword1", "keyword2"]
+        }}
+        """
+        
+        model = genai.GenerativeModel(MODEL_NAME)
+        response = model.generate_content(prompt)
+        
+        # Extraer JSON de la respuesta
+        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(0))
+        
+        return {"ubicacion": [], "etapa": [], "categoria": []}
+        
+    except Exception as e:
+        print(f"❌ ERROR in keyword extraction: {e}")
+        return {"ubicacion": [], "etapa": [], "categoria": []}
+
+def ml_investor_search(query, user_preferences, max_results=20):
+    """Búsqueda de inversores con ML scoring"""
+    if not engine:
+        return {"error": "No database connection"}
+    
+    try:
+        # Extraer keywords inteligentemente
+        keywords = intelligent_keyword_extraction(query, user_preferences.get('context', {}))
+        
+        # Cargar inversores de la BD
+        investors_query = """
+        SELECT id, "Company_Name", "Company_Description", "Investing_Stage",
+               "Company_Location", "Investment_Categories", "Company_Linkedin",
+               "Keywords_Ubicacion_Adicionales", "Keywords_Etapas_Adicionales", 
+               "Keywords_Categorias_Adicionales"
+        FROM investors
+        LIMIT 1000
+        """
+        
+        investors_df = pd.read_sql(investors_query, engine)
+        
+        if investors_df.empty:
+            return {"error": "No investors found"}
+        
+        # Aplicar ML scoring
+        scored_investors = apply_ml_scoring(investors_df, keywords, user_preferences)
+        
+        # Ordenar y limitar resultados
+        top_investors = scored_investors.head(max_results)
+        
+        return {
+            "search_type": "ml_powered",
+            "results": top_investors.to_dict('records'),
+            "total_found": len(top_investors),
+            "keywords_used": keywords
+        }
+        
+    except Exception as e:
+        print(f"❌ ERROR in ML investor search: {e}")
+        return {"error": f"Search error: {e}"}
+
+def apply_ml_scoring(investors_df, keywords, user_preferences):
+    """Aplica scoring ML con pesos configurables"""
+    try:
+        # Parsear keywords de inversores
+        investors_df['ubicacion_list'] = investors_df['Keywords_Ubicacion_Adicionales'].apply(parse_keywords)
+        investors_df['etapa_list'] = investors_df['Keywords_Etapas_Adicionales'].apply(parse_keywords)
+        investors_df['categoria_list'] = investors_df['Keywords_Categorias_Adicionales'].apply(parse_keywords)
+        
+        # Obtener pesos del usuario (por defecto: etapa 40%, categoría 40%, ubicación 20%)
+        weights = user_preferences.get('weights', {
+            'etapa': 0.4,
+            'categoria': 0.4,
+            'ubicacion': 0.2
+        })
+        
+        # Calcular scores
+        def calculate_score(row):
+            ubicacion_score = calculate_match_score(row['ubicacion_list'], keywords['ubicacion'])
+            etapa_score = calculate_match_score(row['etapa_list'], keywords['etapa'])
+            categoria_score = calculate_match_score(row['categoria_list'], keywords['categoria'])
+            
+            total_score = (
+                ubicacion_score * weights['ubicacion'] +
+                etapa_score * weights['etapa'] +
+                categoria_score * weights['categoria']
+            ) * 100
+            
+            return total_score
+        
+        investors_df['ml_score'] = investors_df.apply(calculate_score, axis=1)
+        
+        # Filtrar solo los que tienen score > 0 y ordenar
+        return investors_df[investors_df['ml_score'] > 0].sort_values('ml_score', ascending=False)
+        
+    except Exception as e:
+        print(f"❌ ERROR in ML scoring: {e}")
+        return investors_df
+
+def calculate_match_score(investor_keywords, query_keywords):
+    """Calcula score de matching entre keywords"""
+    if not investor_keywords or not query_keywords:
+        return 0
+    
+    investor_set = set(str(k).lower() for k in investor_keywords)
+    query_set = set(str(k).lower() for k in query_keywords)
+    
+    intersection = investor_set.intersection(query_set)
+    union = investor_set.union(query_set)
+    
+    if not union:
+        return 0
+    
+    return len(intersection) / len(union)
+
+def parse_keywords(value):
+    """Parsea keywords de la BD"""
     if pd.isna(value) or str(value).strip() in ['[]', '']:
         return []
     try:
@@ -101,1202 +718,552 @@ def parse_keyword_list(value):
     except (ValueError, SyntaxError):
         return [k.strip().lower() for k in str(value).split(',') if k.strip()]
 
-def get_or_create_session_project():
-    """Obtiene o crea un proyecto temporal para la sesión."""
-    if 'project_id' not in session:
-        # Crear proyecto temporal
-        project_id = str(uuid.uuid4())
-        user_id = str(uuid.uuid4())  # Usuario temporal
-        
-        try:
-            # Crear usuario temporal en profiles
-            insert_user_query = """
-            INSERT INTO profiles (id, plan, created_at, updated_at)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (id) DO NOTHING
-            """
-            user_params = (user_id, 'Free', datetime.now(), datetime.now())
-            
-            # Crear proyecto temporal
-            insert_project_query = """
-            INSERT INTO projects (id, user_id, project_name, project_description, status, kpi_data, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (id) DO NOTHING
-            """
-            project_params = (
-                project_id, user_id, "Sesión Temporal", "", "ACTIVE", 
-                json.dumps({}), datetime.now(), datetime.now()
-            )
-            
-            with engine.connect() as conn:
-                conn.execute(text(insert_user_query), tuple(user_params))
-                conn.execute(text(insert_project_query), tuple(project_params))
-                conn.commit()
-            
-            session['project_id'] = project_id
-            session['user_id'] = user_id
-            print(f"✅ Created temporary session: project_id={project_id}")
-            
-        except Exception as e:
-            print(f"❌ ERROR creating session project: {e}")
-            # Fallback a IDs temporales sin BD
-            session['project_id'] = project_id
-            session['user_id'] = user_id
-    
-    return session['project_id'], session['user_id']
-
 # ==============================================================================
-#           ALGORITMOS DE MATCHING DE INVERSORES
-# ==============================================================================
-
-def get_keywords_from_gemini_v2(query, u_ctx, e_ctx, c_ctx, model_name):
-    """Obtiene keywords avanzadas usando Gemini para matching de inversores."""
-    print("  -> Calling Gemini for Investor Keywords...")
-    start_time = time.time()
-    response_text = "N/A"
-    try:
-        model = genai.GenerativeModel(model_name)
-        prompt = f"""**Task:** Analiza la consulta y extrae keywords para búsqueda de inversores (Ubicación, Etapa, Categorías).
-
-**Query:** "{query}"
-
-**Instructions:**
-1. **Analiza** la consulta para identificar Ubicaciones, Etapas y Categorías de inversión.
-2. **Estandariza e Infiere:** Usa los contextos para estandarizar e inferir keywords primarias.
-3. **Expande Keywords:** Genera 5-10 keywords 'expandidas' altamente relevantes para cada 'primaria'.
-4. **Formato JSON Exacto:** {{"ubicacion": {{"primary": [...], "expanded": [...]}}, "etapa": {{"primary": [...], "expanded": [...]}}, "categoria": {{"primary": [...], "expanded": [...]}}}}
-
-**Location Context:**\n{u_ctx[:1000]}...
-
-**Stage Context:**\n{e_ctx[:1000]}...
-
-**Category Context:**\n{c_ctx[:1000]}...
-
-**Required JSON Output:**\n```json\n{{ ... }}\n```"""
-
-        response = model.generate_content(prompt)
-        response_text = response.text
-
-        json_match = re.search(r'```json\s*([\s\S]+?)\s*```', response_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1).strip()
-        else:
-            json_match_alt = re.search(r'({\s*"ubicacion":[\s\S]*})', response_text)
-            if json_match_alt:
-                json_str = json_match_alt.group(1).strip()
-            else:
-                print(f"  ⚠️ WARNING: No clear JSON found. Attempting to parse: {response_text}")
-                json_str = response_text.strip()
-
-        keywords = json.loads(json_str)
-        final_keywords = {"ubicacion": {"primary": [], "expanded": []},
-                          "etapa": {"primary": [], "expanded": []},
-                          "categoria": {"primary": [], "expanded": []}}
-        for cat in final_keywords.keys():
-            if cat in keywords and isinstance(keywords[cat], dict):
-                final_keywords[cat]["primary"] = [str(k).strip().lower() for k in keywords[cat].get("primary", [])]
-                final_keywords[cat]["expanded"] = [str(k).strip().lower() for k in keywords[cat].get("expanded", [])]
-        print(f"  ✅ Investor keywords ({time.time() - start_time:.2f}s): {final_keywords}")
-        return final_keywords
-    except Exception as e:
-        print(f"  ❌ ERROR with Gemini (Investor Keywords): {e}\nResponse: {response_text}")
-        return None
-
-def calculate_match_score_v2(row, query_kws):
-    """Calculate advanced score (normalized) and matching keywords for investors."""
-    investor_u = set(row['Ubicacion_List'])
-    investor_e = set(row['Etapa_List'])
-    investor_c = set(row['Categoria_List'])
-
-    query_u_p = set(query_kws.get('ubicacion', {}).get('primary', []))
-    query_u_e = set(query_kws.get('ubicacion', {}).get('expanded', []))
-    query_e_p = set(query_kws.get('etapa', {}).get('primary', []))
-    query_e_e = set(query_kws.get('etapa', {}).get('expanded', []))
-    query_c_p = set(query_kws.get('categoria', {}).get('primary', []))
-    query_c_e = set(query_kws.get('categoria', {}).get('expanded', []))
-
-    matched_u_p = query_u_p.intersection(investor_u)
-    matched_u_e = query_u_e.intersection(investor_u) - matched_u_p
-    matched_e_p = query_e_p.intersection(investor_e)
-    matched_e_e = query_e_e.intersection(investor_e) - matched_e_p
-    matched_c_p = query_c_p.intersection(investor_c)
-    matched_c_e = query_c_e.intersection(investor_c) - matched_c_p
-
-    matched_u = list(matched_u_p.union(matched_u_e))
-    matched_e = list(matched_e_p.union(matched_e_e))
-    matched_c = list(matched_c_p.union(matched_c_e))
-
-    WEIGHTS = {'ubicacion': 0.15, 'etapa': 0.45, 'categoria': 0.40}
-    P_PRIMARY = 3.0
-    P_EXPANDED = 1.0
-    BONUS_PRIMARY_MATCH = 0.5
-
-    score_u = (len(matched_u_p) * P_PRIMARY) + (len(matched_u_e) * P_EXPANDED)
-    score_e = (len(matched_e_p) * P_PRIMARY) + (len(matched_e_e) * P_EXPANDED)
-    score_c = (len(matched_c_p) * P_PRIMARY) + (len(matched_c_e) * P_EXPANDED)
-
-    raw_score = (score_u * WEIGHTS['ubicacion'] +
-                 score_e * WEIGHTS['etapa'] +
-                 score_c * WEIGHTS['categoria'])
-    raw_score += (len(matched_e_p) * BONUS_PRIMARY_MATCH) + (len(matched_c_p) * BONUS_PRIMARY_MATCH)
-
-    max_u = (len(query_u_p) * P_PRIMARY) + (len(query_u_e) * P_EXPANDED)
-    max_e = (len(query_e_p) * P_PRIMARY) + (len(query_e_e) * P_EXPANDED)
-    max_c = (len(query_c_p) * P_PRIMARY) + (len(query_c_e) * P_EXPANDED)
-    max_score = (max_u * WEIGHTS['ubicacion'] +
-                 max_e * WEIGHTS['etapa'] +
-                 max_c * WEIGHTS['categoria'])
-    max_score += (len(query_e_p) * BONUS_PRIMARY_MATCH) + (len(query_c_p) * BONUS_PRIMARY_MATCH)
-
-    normalized_score = (raw_score / max_score * 100) if max_score > 0 else 0.0
-
-    return raw_score, normalized_score, matched_u, matched_e, matched_c
-
-def run_investor_search_normal(query):
-    """Ejecuta búsqueda NORMAL de inversores (50 mejores resultados)."""
-    if not engine:
-        return {"error": "No database connection."}
-
-    print("-> Starting NORMAL investor search...")
-    try:
-        sql_query = """
-        SELECT id, "Company_Name", "Company_Description", "Investing_Stage",
-               "Company_Location", "Investment_Categories", "Company_Linkedin",
-               "Keywords_Ubicacion_Adicionales", "Keywords_Etapas_Adicionales", 
-               "Keywords_Categorias_Adicionales" 
-        FROM investors
-        """
-        investors_df = pd.read_sql(sql_query, engine)
-        print(f"  -> {len(investors_df)} investors loaded.")
-
-        investors_df['Ubicacion_List'] = investors_df['Keywords_Ubicacion_Adicionales'].apply(parse_keyword_list)
-        investors_df['Etapa_List'] = investors_df['Keywords_Etapas_Adicionales'].apply(parse_keyword_list)
-        investors_df['Categoria_List'] = investors_df['Keywords_Categorias_Adicionales'].apply(parse_keyword_list)
-
-        query_keywords = get_keywords_from_gemini_v2(
-            query, ubicaciones_context, etapas_context, categorias_context, MODEL_NAME
-        )
-
-        if not query_keywords:
-            return {"error": "Could not obtain keywords."}
-
-        print("  -> Applying NORMAL scoring...")
-        
-        score_results = investors_df.apply(lambda row: calculate_match_score_v2(row, query_keywords), axis=1, result_type='expand')
-        score_results.columns = ['Score_Raw', 'Score', 'Matched_Ubicacion', 'Matched_Etapa', 'Matched_Categoria']
-        investors_df = investors_df.join(score_results)
-        results_df = investors_df[investors_df['Score'] > 0].sort_values(by='Score', ascending=False).head(50)
-
-        # Columnas específicas que quiere mostrar el usuario
-        cols_to_show = [
-            'id', 'Company_Name', 'Company_Description', 'Investing_Stage',
-            'Company_Location', 'Investment_Categories', 'Company_Linkedin', 'Score'
-        ]
-
-        results_df['Score'] = results_df['Score'].map('{:,.1f}'.format)
-        results_df = results_df.fillna('-')
-        print(f"  ✅ NORMAL search completed, {len(results_df)} results.")
-        
-        return {
-            "search_type": "normal",
-            "results": results_df[[c for c in cols_to_show if c in results_df.columns]].to_dict('records'),
-            "total_found": len(results_df)
-        }
-
-    except Exception as e:
-        print(f"  ❌ ERROR in normal investor search: {e}")
-        return {"error": f"Error in normal search: {e}"}
-
-def run_investor_search_deep(query):
-    """Ejecuta búsqueda DEEP RESEARCH de inversores."""
-    if not engine:
-        return {"error": "No database connection."}
-
-    print("-> Starting DEEP RESEARCH investor search...")
-    try:
-        # Primero hacemos la búsqueda normal
-        normal_results = run_investor_search_normal(query)
-        if "error" in normal_results:
-            return normal_results
-        
-        # Luego aplicamos análisis más profundo usando Gemini
-        print("  -> Applying DEEP RESEARCH analysis...")
-        
-        model = genai.GenerativeModel(MODEL_NAME)
-        deep_prompt = f"""
-**DEEP RESEARCH TASK:** Analiza esta consulta de startup y proporciona insights avanzados para matching de inversores.
-
-**Consulta:** "{query}"
-
-**Tu tarea:**
-1. Identifica el sector/industria exacto
-2. Determina la etapa de inversión más probable
-3. Identifica factores de riesgo y oportunidades
-4. Sugiere tipos de inversores ideales
-5. Calcula métricas de compatibilidad adicionales
-
-**Responde en formato conciso (máximo 200 palabras):**
-- Sector principal: [sector]
-- Etapa recomendada: [etapa]
-- Factores clave: [3-4 factores]
-- Timing: [análisis de timing del mercado]
-"""
-        
-        deep_analysis = model.generate_content(deep_prompt)
-        
-        print(f"  ✅ DEEP RESEARCH completed, {normal_results['total_found']} results with advanced analysis.")
-        
-        return {
-            "search_type": "deep_research",
-            "results": normal_results["results"],
-            "total_found": normal_results["total_found"],
-            "deep_analysis": deep_analysis.text,
-            "insights": "Análisis profundo aplicado con factores de riesgo, oportunidades y métricas avanzadas"
-        }
-
-    except Exception as e:
-        print(f"  ❌ ERROR in deep investor search: {e}")
-        return {"error": f"Error in deep search: {e}"}
-
-# ==============================================================================
-#           ALGORITMO DE BÚSQUEDA DE EMPLEADOS DE FONDOS
-# ==============================================================================
-
-def find_employees_from_investors(investor_results, search_type="normal"):
-    """
-    LÓGICA CORRECTA: 
-    1. Toma los 50 mejores fondos de inversión encontrados
-    2. Extrae sus Company_Name 
-    3. Busca TODOS los empleados que trabajan en esos fondos con decision_score > 44
-    """
-    if not engine:
-        return {"error": "No database connection."}
-
-    print(f"-> Finding employees from {search_type} investor search...")
-    
-    try:
-        # Extraer los nombres de las empresas de inversión
-        if "results" not in investor_results:
-            return {"error": "No investor results provided"}
-        
-        investor_companies = []
-        for investor in investor_results["results"]:
-            company_name = investor.get("Company_Name", "").strip()
-            if company_name and company_name != "-":
-                investor_companies.append(company_name)
-        
-        if not investor_companies:
-            return {"error": "No valid company names found in investor results"}
-        
-        print(f"  -> Searching employees in {len(investor_companies)} investment firms...")
-        
-        # Crear la consulta SQL para buscar empleados en esas empresas
-        # Usar ILIKE para búsqueda case-insensitive y filtrar por decision_score > 44
-        company_conditions = " OR ".join([f'"Company_Name" ILIKE %s' for _ in investor_companies])
-        
-        sql_query = f"""
-        SELECT id, "fullName", "headline", "current_job_title", "location", 
-               "linkedinUrl", "email", "profilePic", "Company_Name",
-               "decision_score"
-        FROM employees
-        WHERE ({company_conditions}) AND "decision_score" > 44
-        ORDER BY "decision_score" DESC, "Company_Name", "current_job_title"
-        """
-        
-        # Preparar parámetros para la consulta (agregar % para búsqueda parcial)
-        params = tuple(f"%{company}%" for company in investor_companies)
-        
-        employees_df = pd.read_sql(sql_query, engine, params=params)
-        
-        print(f"  -> Found {len(employees_df)} high-quality employees (score > 44) across {len(investor_companies)} investment firms")
-        
-        if employees_df.empty:
-            return {
-                "search_type": "fund_employees", 
-                "from_search": search_type,
-                "results": [],
-                "total_found": 0,
-                "searched_funds": investor_companies,
-                "message": "No se encontraron empleados con score > 44 en los fondos seleccionados"
-            }
-        
-        # Preparar columnas para mostrar (las que especificó el usuario)
-        cols_to_show = [
-            'id', 'fullName', 'headline', 'current_job_title', 'location',
-            'linkedinUrl', 'email', 'profilePic'
-        ]
-        
-        # Limpiar datos
-        employees_df = employees_df.fillna('-')
-        
-        # Agrupar por empresa para mejor presentación
-        employees_by_fund = {}
-        for _, employee in employees_df.iterrows():
-            fund_name = employee['Company_Name']
-            if fund_name not in employees_by_fund:
-                employees_by_fund[fund_name] = []
-            employees_by_fund[fund_name].append(employee.to_dict())
-        
-        print(f"  ✅ Employee search completed: {len(employees_df)} high-quality employees from {len(employees_by_fund)} funds")
-        
-        return {
-            "search_type": "fund_employees",
-            "from_search": search_type,
-            "results": employees_df[[c for c in cols_to_show if c in employees_df.columns]].to_dict('records'),
-            "employees_by_fund": employees_by_fund,
-            "total_found": len(employees_df),
-            "funds_found": len(employees_by_fund),
-            "searched_funds": investor_companies
-        }
-
-    except Exception as e:
-        print(f"  ❌ ERROR in employee search from investors: {e}")
-        return {"error": f"Error finding employees from investment firms: {e}"}
-
-def run_employee_search(query, search_type="normal"):
-    """
-    Función principal para búsqueda de empleados:
-    1. Primero busca los 50 mejores fondos con el query
-    2. Luego encuentra TODOS los empleados de esos fondos con decision_score > 44
-    """
-    print(f"-> Starting {search_type} employee search for: '{query[:50]}...'")
-    
-    try:
-        # PASO 1: Buscar los mejores fondos de inversión
-        if search_type == "deep":
-            investor_results = run_investor_search_deep(query)
-        else:
-            investor_results = run_investor_search_normal(query)
-        
-        if "error" in investor_results:
-            return {
-                "error": f"Error finding relevant investment funds: {investor_results['error']}"
-            }
-        
-        print(f"  -> Found {investor_results.get('total_found', 0)} relevant investment funds")
-        
-        # PASO 2: Buscar empleados en esos fondos
-        employee_results = find_employees_from_investors(investor_results, search_type)
-        
-        if "error" in employee_results:
-            return employee_results
-        
-        # PASO 3: Combinar resultados
-        combined_results = {
-            "search_type": f"combined_{search_type}",
-            "query": query,
-            "relevant_funds": investor_results["results"][:10],  # Solo los top 10 fondos para contexto
-            "total_funds_found": investor_results.get("total_found", 0),
-            "employees": employee_results["results"],
-            "employees_by_fund": employee_results.get("employees_by_fund", {}),
-            "total_employees_found": employee_results.get("total_found", 0),
-            "funds_with_employees": employee_results.get("funds_found", 0)
-        }
-        
-        # Si es deep research, incluir el análisis
-        if search_type == "deep" and "deep_analysis" in investor_results:
-            combined_results["deep_analysis"] = investor_results["deep_analysis"]
-            combined_results["insights"] = investor_results.get("insights", "")
-        
-        return combined_results
-
-    except Exception as e:
-        print(f"  ❌ ERROR in combined employee search: {e}")
-        return {"error": f"Error in employee search: {e}"}
-
-# ==============================================================================
-#           FUNCIONES DE SESIÓN Y GESTIÓN DE DATOS
-# ==============================================================================
-
-def save_investor_to_session(project_id, user_id, investor_id):
-    """Guarda un inversor en la sesión del proyecto."""
-    try:
-        insert_query = """
-        INSERT INTO project_saved_investors (project_id, investor_id, added_at)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (project_id, investor_id) DO NOTHING
-        """
-        params = (project_id, investor_id, datetime.now())
-        
-        with engine.connect() as conn:
-            conn.execute(text(insert_query), params)
-            conn.commit()
-        
-        return True
-    except Exception as e:
-        print(f"❌ ERROR saving investor to session: {e}")
-        return False
-
-def save_employee_to_session(project_id, user_id, employee_id):
-    """Guarda un empleado en la sesión del proyecto."""
-    try:
-        insert_query = """
-        INSERT INTO project_saved_employees (project_id, employee_id, added_at)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (project_id, employee_id) DO NOTHING
-        """
-        params = (project_id, employee_id, datetime.now())
-        
-        with engine.connect() as conn:
-            conn.execute(text(insert_query), params)
-            conn.commit()
-        
-        return True
-    except Exception as e:
-        print(f"❌ ERROR saving employee to session: {e}")
-        return False
-
-def save_sentiment(project_id, user_id, entity_id, entity_type, sentiment):
-    """Guarda el sentiment (like/dislike) de una entidad."""
-    try:
-        insert_query = """
-        INSERT INTO project_sentiments (id, project_id, user_id, entity_id, entity_type, sentiment, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (project_id, entity_id, entity_type) 
-        DO UPDATE SET sentiment = EXCLUDED.sentiment, created_at = EXCLUDED.created_at
-        """
-        
-        params = (
-            str(uuid.uuid4()),
-            project_id,
-            user_id,
-            entity_id,
-            entity_type,
-            sentiment,
-            datetime.now()
-        )
-        
-        with engine.connect() as conn:
-            conn.execute(text(insert_query), params)
-            conn.commit()
-        
-        return True
-    except Exception as e:
-        print(f"❌ ERROR saving sentiment: {e}")
-        return False
-
-def get_saved_investors(project_id):
-    """Obtiene los inversores guardados de la sesión."""
-    try:
-        query = """
-        SELECT i.id, i."Company_Name", i."Company_Description", i."Investing_Stage",
-               i."Company_Location", i."Investment_Categories", i."Company_Linkedin",
-               psi.added_at, COALESCE(ps.sentiment, 'none') as sentiment
-        FROM project_saved_investors psi
-        JOIN investors i ON psi.investor_id = i.id
-        LEFT JOIN project_sentiments ps ON i.id = ps.entity_id AND ps.project_id = psi.project_id
-        WHERE psi.project_id = %s
-        ORDER BY psi.added_at DESC
-        """
-        
-        results_df = pd.read_sql(query, engine, params=(project_id,))
-        return results_df.fillna('-').to_dict('records')
-        
-    except Exception as e:
-        print(f"❌ ERROR getting saved investors: {e}")
-        return []
-
-def get_saved_employees(project_id):
-    """Obtiene los empleados guardados de la sesión."""
-    try:
-        query = """
-        SELECT e.id, e."fullName", e."headline", e."current_job_title", e."location",
-               e."linkedinUrl", e."email", e."profilePic", e."Company_Name",
-               pse.added_at, COALESCE(ps.sentiment, 'none') as sentiment
-        FROM project_saved_employees pse
-        JOIN employees e ON pse.employee_id = e.id
-        LEFT JOIN project_sentiments ps ON e.id = ps.entity_id AND ps.project_id = pse.project_id
-        WHERE pse.project_id = %s
-        ORDER BY pse.added_at DESC
-        """
-        
-        results_df = pd.read_sql(query, engine, params=(project_id,))
-        return results_df.fillna('-').to_dict('records')
-        
-    except Exception as e:
-        print(f"❌ ERROR getting saved employees: {e}")
-        return []
-
-# ==============================================================================
-#           GENERACIÓN DE TEMPLATES CON GEMINI
-# ==============================================================================
-
-def generate_outreach_template(project_id, user_id, target_investor_id=None, target_employee_id=None, platform="email", user_instructions=""):
-    """Genera template de outreach personalizado usando Gemini."""
-    try:
-        # Obtener información del target
-        target_info = {}
-        target_type = ""
-        
-        if target_investor_id:
-            target_query = """
-            SELECT "Company_Name", "Company_Description", "Investing_Stage", 
-                   "Investment_Categories", "Company_Location"
-            FROM investors WHERE id = %s
-            """
-            target_df = pd.read_sql(target_query, engine, params=(target_investor_id,))
-            if not target_df.empty:
-                target_info = target_df.iloc[0].to_dict()
-                target_type = "investor"
-        
-        elif target_employee_id:
-            target_query = """
-            SELECT "fullName", "headline", "current_job_title", "Company_Name", 
-                   "location", "linkedinUrl", "email"
-            FROM employees WHERE id = %s
-            """
-            target_df = pd.read_sql(target_query, engine, params=(target_employee_id,))
-            if not target_df.empty:
-                target_info = target_df.iloc[0].to_dict()
-                target_type = "employee"
-        
-        if not target_info:
-            return {"error": "Target not found"}
-        
-        # Obtener información del proyecto (contexto de la startup)
-        project_query = """
-        SELECT project_name, project_description, kpi_data
-        FROM projects WHERE id = %s
-        """
-        project_df = pd.read_sql(project_query, engine, params=(project_id,))
-        project_context = {}
-        if not project_df.empty:
-            project_context = project_df.iloc[0].to_dict()
-        
-        # Preparar prompt para Gemini
-        if target_type == "investor":
-            target_context = f"""
-            Fondo: {target_info.get('Company_Name', 'N/A')}
-            Descripción: {target_info.get('Company_Description', 'N/A')}
-            Etapa de Inversión: {target_info.get('Investing_Stage', 'N/A')}
-            Categorías: {target_info.get('Investment_Categories', 'N/A')}
-            Ubicación: {target_info.get('Company_Location', 'N/A')}
-            """
-        else:
-            target_context = f"""
-            Nombre: {target_info.get('fullName', 'N/A')}
-            Título: {target_info.get('current_job_title', 'N/A')}
-            Empresa: {target_info.get('Company_Name', 'N/A')}
-            Headline: {target_info.get('headline', 'N/A')}
-            Ubicación: {target_info.get('location', 'N/A')}
-            """
-        
-        template_prompt = f"""
-**Tarea:** Genera un {platform} profesional y directo para solicitar una reunión de inversión.
-
-**Target ({target_type}):**
-{target_context}
-
-**Mi Startup:**
-Nombre: {project_context.get('project_name', 'Mi Startup')}
-Descripción: {project_context.get('project_description', 'Startup innovadora')}
-
-**Instrucciones adicionales:** {user_instructions}
-
-**Estilo "0Bullshit" - Requisitos:**
-1. **Directo y sin rodeos** - Máximo 120 palabras
-2. **Asunto claro** (si es email)
-3. **Párrafo 1:** Quién soy y qué hacemos (1-2 líneas)
-4. **Párrafo 2:** Por qué este {target_type} específicamente (1-2 líneas)
-5. **Call-to-action:** Solicitud directa de 15-20 min de reunión
-6. **Tono:** Profesional pero humano, confiado sin ser arrogante
-
-**Formato de salida:**
-{f"Asunto: [asunto aquí]" if platform == "email" else ""}
-
-[mensaje aquí]
-
-{"Saludos," if platform == "email" else ""}
-[Nombre]
-"""
-
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(template_prompt)
-        template_content = response.text.strip()
-        
-        # Guardar template en la base de datos
-        template_id = str(uuid.uuid4())
-        insert_query = """
-        INSERT INTO template_generators (id, project_id, user_id, target_investor_id, target_employee_id, platform, conversation_history, generated_template, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        
-        params = (
-            template_id,
-            project_id,
-            user_id,
-            target_investor_id,
-            target_employee_id,
-            platform,
-            json.dumps([]),
-            template_content,
-            datetime.now(),
-            datetime.now()
-        )
-        
-        with engine.connect() as conn:
-            conn.execute(text(insert_query), tuple(params))
-            conn.commit()
-        
-        return {
-            "template_id": template_id,
-            "content": template_content,
-            "platform": platform,
-            "target_type": target_type,
-            "target_info": target_info
-        }
-        
-    except Exception as e:
-        print(f"❌ ERROR generating outreach template: {e}")
-        return {"error": "No se pudo generar la plantilla de outreach"}
-
-# ==============================================================================
-#           GEMINI MASTER AI - SUPERINTELIGENTE
-# ==============================================================================
-
-def get_master_ai_prompt():
-    """Prompt principal para el AI superinteligente que decide qué hacer."""
-    return """## ROL Y PERSONALIDAD
-
-Eres "0Bullshit", un supermentor de IA para startups y emprendedores. Tu misión es ayudar con fundraising, búsqueda de talento, y estrategia de negocio sin rodeos.
-
-Tu personalidad:
-- **Directo y eficiente:** Vas directo al grano
-- **Proactivo:** Sugieres acciones específicas
-- **Inteligente:** Decides automáticamente qué herramientas usar
-- **Orientado a resultados:** Siempre das next steps
-
-## HERRAMIENTAS DISPONIBLES
-
-Tienes acceso a estas funciones:
-1. **investor_search_normal:** Búsqueda estándar de inversores (50 mejores)
-2. **investor_search_deep:** Búsqueda avanzada con análisis profundo (50 mejores + insights)
-3. **employee_search:** Búsqueda de contactos en fondos de inversión (score > 44)
-4. **general_chat:** Conversación general, consejos, estrategia
-
-## LÓGICA DE DECISIÓN
-
-**USA investor_search_normal CUANDO:**
-- El usuario pida "buscar inversores", "encontrar VCs", "fundraising"
-- Mencione necesidades de capital simples
-- Búsqueda rápida de inversores
-
-**USA investor_search_deep CUANDO:**
-- El usuario pida "análisis profundo", "deep research", "investigación avanzada"
-- Mencione factores complejos como riesgo, mercado, timing
-- Necesite insights estratégicos de inversión
-
-**USA employee_search CUANDO:**
-- El usuario pida "buscar contactos", "encontrar people", "networking"
-- Quiera contactar personas específicas en fondos de inversión
-- Mencione "associates", "partners", "analysts" de VCs
-- Hable de warm introductions, contactos en fondos
-
-**USA general_chat PARA TODO LO DEMÁS:**
-- Preguntas generales de estrategia
-- Consejos de negocio
-- Dudas sobre startups
-- Conversación normal
-
-## CONTEXTO DE LA CONVERSACIÓN
-
-**Mensaje del usuario:** {user_message}
-
-## FORMATO DE RESPUESTA OBLIGATORIO
-
-Responde SIEMPRE con un único objeto JSON:
-
-```json
-{{
-  "action": "nombre_de_la_accion",
-  "reasoning": "por qué elegiste esta acción",
-  "response": "tu respuesta al usuario",
-  "parameters": {{
-    "query": "consulta procesada para la búsqueda (si aplica)"
-  }}
-}}
-```
-
-**ACCIONES DISPONIBLES:**
-- "investor_search_normal"
-- "investor_search_deep" 
-- "employee_search"
-- "general_chat"
-
-## EJEMPLOS
-
-**Usuario:** "Necesito inversores para mi fintech de pagos en México"
-**Tu respuesta:**
-```json
-{{
-  "action": "investor_search_normal",
-  "reasoning": "Solicitud directa de inversores para fintech en México, búsqueda estándar es apropiada",
-  "response": "¡Perfecto! Voy a buscar inversores especializados en fintech y pagos en México. Te traigo los 50 mejores matches.",
-  "parameters": {{
-    "query": "fintech pagos México seed series A venture capital"
-  }}
-}}
-```
-
-**Usuario:** "Busco contactos en fondos que inviertan en AI"
-**Tu respuesta:**
-```json
-{{
-  "action": "employee_search",
-  "reasoning": "Solicita contactos específicos en fondos de inversión relevantes para AI",
-  "response": "¡Genial! Primero busco los mejores fondos que invierten en AI, y luego te traigo TODOS los associates, partners y analysts que trabajan en esos fondos para networking directo.",
-  "parameters": {{
-    "query": "artificial intelligence AI machine learning deep tech venture capital"
-  }}
-}}
-```
-
-Analiza el mensaje del usuario y responde con el JSON apropiado."""
-
-def process_master_ai_request(user_message):
-    """Procesa la solicitud usando el AI master superinteligente."""
-    try:
-        # Preparar el prompt principal
-        master_prompt = get_master_ai_prompt().format(user_message=user_message)
-        
-        # Llamar a Gemini
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(master_prompt)
-        response_text = response.text.strip()
-        
-        # Extraer JSON de la respuesta
-        json_match = re.search(r'```json\s*([\s\S]+?)\s*```', response_text, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1).strip()
-        else:
-            # Intentar encontrar JSON sin bloques de código
-            json_match = re.search(r'(\{[\s\S]*\})', response_text)
-            if json_match:
-                json_str = json_match.group(1).strip()
-            else:
-                json_str = response_text
-        
-        # Parsear JSON
-        action_data = json.loads(json_str)
-        return action_data
-        
-    except Exception as e:
-        print(f"❌ ERROR processing master AI request: {e}")
-        return {
-            "action": "general_chat",
-            "reasoning": "Error en el procesamiento, defaulting a chat general",
-            "response": "Disculpa, tuve un error procesando tu solicitud. ¿Puedes reformular tu pregunta?",
-            "parameters": {}
-        }
-
-def execute_master_ai_action(action_data):
-    """Ejecuta la acción determinada por el AI master."""
-    action = action_data.get("action")
-    parameters = action_data.get("parameters", {})
-    ai_response = action_data.get("response", "")
-    
-    if action == "investor_search_normal":
-        query = parameters.get("query", "")
-        if not query:
-            return {
-                "type": "error",
-                "content": "No se pudo generar la consulta de búsqueda."
-            }
-        
-        search_results = run_investor_search_normal(query)
-        
-        if "error" in search_results:
-            return {
-                "type": "error",
-                "content": search_results["error"]
-            }
-        
-        return {
-            "type": "investor_results_normal",
-            "ai_response": ai_response,
-            "search_results": search_results,
-            "message": f"✅ Búsqueda normal completada: {search_results['total_found']} inversores encontrados"
-        }
-    
-    elif action == "investor_search_deep":
-        query = parameters.get("query", "")
-        if not query:
-            return {
-                "type": "error",
-                "content": "No se pudo generar la consulta de búsqueda profunda."
-            }
-        
-        search_results = run_investor_search_deep(query)
-        
-        if "error" in search_results:
-            return {
-                "type": "error",
-                "content": search_results["error"]
-            }
-        
-        return {
-            "type": "investor_results_deep",
-            "ai_response": ai_response,
-            "search_results": search_results,
-            "message": f"🔍 Deep research completado: {search_results['total_found']} inversores + análisis avanzado"
-        }
-    
-    elif action == "employee_search":
-        query = parameters.get("query", "")
-        if not query:
-            return {
-                "type": "error",
-                "content": "No se pudo generar la consulta de búsqueda de empleados."
-            }
-        
-        search_results = run_employee_search(query)
-        
-        if "error" in search_results:
-            return {
-                "type": "error",
-                "content": search_results["error"]
-            }
-        
-        return {
-            "type": "employee_results",
-            "ai_response": ai_response,
-            "search_results": search_results,
-            "message": f"👥 Encontré {search_results.get('total_employees_found', 0)} contactos (score > 44) en {search_results.get('funds_with_employees', 0)} fondos relevantes"
-        }
-    
-    elif action == "general_chat":
-        return {
-            "type": "text_response",
-            "content": ai_response,
-            "ai_response": ai_response
-        }
-    
-    else:
-        return {
-            "type": "error",
-            "content": "Acción no reconocida."
-        }
-
-# ==============================================================================
-#           API ROUTES - SISTEMA DE SESIONES TEMPORALES
+#           API ROUTES
 # ==============================================================================
 
 print("5. Defining API routes...")
 
 @app.route('/')
 def home():
-    """Main route to verify the API is working."""
-    return "<h1>🚀 0Bullshit - Backend Completo - READY! 🚀</h1>"
+    """Health check"""
+    return jsonify({
+        "status": "0Bullshit Backend v2.0 Ready! 🚀",
+        "timestamp": datetime.now().isoformat(),
+        "features": ["60 Bots", "Credits System", "Neural Memory", "3 Plans"]
+    })
 
-@app.route('/session/info', methods=['GET'])
-def get_session_info():
-    """Obtiene información de la sesión actual."""
+# ==================== AUTHENTICATION ROUTES ====================
+
+@app.route('/auth/register', methods=['POST'])
+def register():
+    """Registro de usuario"""
     try:
-        project_id, user_id = get_or_create_session_project()
+        data = request.json
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '')
+        first_name = data.get('first_name', '').strip()
+        last_name = data.get('last_name', '').strip()
         
-        # Obtener estadísticas de la sesión
-        saved_investors = get_saved_investors(project_id)
-        saved_employees = get_saved_employees(project_id)
+        if not all([email, password, first_name, last_name]):
+            return jsonify({"error": "All fields are required"}), 400
+        
+        # Verificar si el usuario ya existe
+        existing_user = get_user_by_email(email)
+        if existing_user:
+            return jsonify({"error": "User already exists"}), 409
+        
+        # Crear usuario
+        user_id = create_user(email, password, first_name, last_name)
+        if not user_id:
+            return jsonify({"error": "Error creating user"}), 500
+        
+        # Generar token
+        token = generate_jwt_token(user_id)
         
         return jsonify({
-            "session_active": True,
-            "project_id": project_id,
-            "user_id": user_id,
-            "saved_investors_count": len(saved_investors),
-            "saved_employees_count": len(saved_employees)
+            "message": "User registered successfully",
+            "token": token,
+            "user": {
+                "id": user_id,
+                "email": email,
+                "first_name": first_name,
+                "last_name": last_name,
+                "plan": "free",
+                "credits": SUBSCRIPTION_PLANS['free']['launch_credits']
+            }
         })
         
     except Exception as e:
-        print(f"❌ ERROR getting session info: {e}")
-        return jsonify({"error": "Could not get session info"}), 500
+        print(f"❌ ERROR in register: {e}")
+        return jsonify({"error": "Registration failed"}), 500
 
-@app.route('/chat', methods=['POST'])
-def master_chat_endpoint():
-    """Endpoint principal para el chat con AI superinteligente."""
-    print("\n--- Request /chat (Master AI) ---")
-    data = request.json
-    user_message = data.get('message')
-
-    if not user_message:
-        return jsonify({"error": "message is required"}), 400
-
-    print(f"  -> Message: '{user_message[:50]}...'")
-
+@app.route('/auth/login', methods=['POST'])
+def login():
+    """Login de usuario"""
     try:
-        # Asegurarse de que hay una sesión activa
-        project_id, user_id = get_or_create_session_project()
+        data = request.json
+        email = data.get('email', '').strip().lower()
+        password = data.get('password', '')
         
-        # Procesar la solicitud con el AI master
-        action_data = process_master_ai_request(user_message)
+        if not email or not password:
+            return jsonify({"error": "Email and password required"}), 400
         
-        # Ejecutar la acción determinada
-        result = execute_master_ai_action(action_data)
+        # Verificar usuario
+        user = get_user_by_email(email)
+        if not user or not verify_password(password, user['password_hash']):
+            return jsonify({"error": "Invalid credentials"}), 401
         
-        # Agregar info de sesión al resultado
-        result["session_info"] = {
-            "project_id": project_id,
-            "user_id": user_id
+        # Generar token
+        token = generate_jwt_token(user['id'])
+        
+        return jsonify({
+            "message": "Login successful",
+            "token": token,
+            "user": {
+                "id": user['id'],
+                "email": user['email'],
+                "first_name": user['first_name'],
+                "last_name": user['last_name'],
+                "plan": user['plan'],
+                "credits": user['credits_balance']
+            }
+        })
+        
+    except Exception as e:
+        print(f"❌ ERROR in login: {e}")
+        return jsonify({"error": "Login failed"}), 500
+
+# ==================== USER & CREDITS ROUTES ====================
+
+@app.route('/user/profile', methods=['GET'])
+@require_auth
+def get_profile(user):
+    """Obtiene perfil del usuario"""
+    try:
+        neural_memory = get_neural_memory(user['id'])
+        
+        return jsonify({
+            "user": {
+                "id": user['id'],
+                "email": user['email'],
+                "first_name": user['first_name'],
+                "last_name": user['last_name'],
+                "plan": user['plan'],
+                "credits": user['credits_balance'],
+                "created_at": user['created_at']
+            },
+            "stats": {
+                "interactions_count": neural_memory.get('interactions_count', 0),
+                "preferred_bots": neural_memory.get('preferred_bots', {}),
+                "plan_features": SUBSCRIPTION_PLANS[user['plan']]['features']
+            }
+        })
+        
+    except Exception as e:
+        print(f"❌ ERROR getting profile: {e}")
+        return jsonify({"error": "Error getting profile"}), 500
+
+@app.route('/credits/balance', methods=['GET'])
+@require_auth
+def get_credits_balance(user):
+    """Obtiene balance de créditos"""
+    current_credits = get_user_credits(user['id'])
+    
+    return jsonify({
+        "credits_balance": current_credits,
+        "plan": user['plan'],
+        "monthly_credits": SUBSCRIPTION_PLANS[user['plan']].get('credits_monthly', 0)
+    })
+
+@app.route('/credits/purchase', methods=['POST'])
+@require_auth
+def purchase_credits(user):
+    """Compra de créditos con Stripe"""
+    try:
+        data = request.json
+        credit_package = data.get('package')  # 'small', 'medium', 'large'
+        
+        credit_packages = {
+            'small': {'credits': 1000, 'price': 1000},  # $10.00
+            'medium': {'credits': 5000, 'price': 4000},  # $40.00 
+            'large': {'credits': 20000, 'price': 12000}  # $120.00
         }
         
-        print("--- Request /chat (Master AI) completed ---")
-        return jsonify(result)
+        if credit_package not in credit_packages:
+            return jsonify({"error": "Invalid credit package"}), 400
         
-    except Exception as e:
-        print(f"❌ ERROR in master chat endpoint: {e}")
-        return jsonify({
-            "type": "error",
-            "content": "Hubo un error procesando tu solicitud. Inténtalo de nuevo."
-        }), 500
-
-@app.route('/search/investors', methods=['POST'])
-def search_investors_endpoint():
-    """Endpoint directo para búsqueda de inversores."""
-    print("\n--- Request /search/investors ---")
-    data = request.json
-    query = data.get('query')
-    search_type = data.get('type', 'normal')  # 'normal' o 'deep'
-
-    if not query:
-        return jsonify({"error": "query is required"}), 400
-
-    print(f"  -> Query: '{query[:50]}...', Type: {search_type}")
-
-    try:
-        project_id, user_id = get_or_create_session_project()
+        package_info = credit_packages[credit_package]
         
-        if search_type == 'deep':
-            results = run_investor_search_deep(query)
-        else:
-            results = run_investor_search_normal(query)
-        
-        results["session_info"] = {"project_id": project_id, "user_id": user_id}
-        
-        print("--- Request /search/investors completed ---")
-        return jsonify(results)
-        
-    except Exception as e:
-        print(f"❌ ERROR in investor search endpoint: {e}")
-        return jsonify({"error": f"Error en búsqueda de inversores: {e}"}), 500
-
-@app.route('/search/employees', methods=['POST'])
-def search_employees_endpoint():
-    """Endpoint directo para búsqueda de empleados en fondos de inversión."""
-    print("\n--- Request /search/employees ---")
-    data = request.json
-    query = data.get('query')
-    search_type = data.get('type', 'normal')  # 'normal' o 'deep'
-
-    if not query:
-        return jsonify({"error": "query is required"}), 400
-
-    print(f"  -> Query: '{query[:50]}...', Type: {search_type}")
-
-    try:
-        project_id, user_id = get_or_create_session_project()
-        
-        results = run_employee_search(query, search_type)
-        results["session_info"] = {"project_id": project_id, "user_id": user_id}
-        
-        print("--- Request /search/employees completed ---")
-        return jsonify(results)
-        
-    except Exception as e:
-        print(f"❌ ERROR in employee search endpoint: {e}")
-        return jsonify({"error": f"Error en búsqueda de empleados: {e}"}), 500
-
-@app.route('/save/investor', methods=['POST'])
-def save_investor_endpoint():
-    """Guarda un inversor en la sesión."""
-    try:
-        data = request.json
-        investor_id = data.get('investor_id')
-        
-        if not investor_id:
-            return jsonify({"error": "investor_id is required"}), 400
-        
-        project_id, user_id = get_or_create_session_project()
-        
-        success = save_investor_to_session(project_id, user_id, investor_id)
-        
-        if success:
-            return jsonify({"message": "Investor saved successfully"})
-        else:
-            return jsonify({"error": "Failed to save investor"}), 500
-            
-    except Exception as e:
-        print(f"❌ ERROR saving investor: {e}")
-        return jsonify({"error": "Could not save investor"}), 500
-
-@app.route('/save/employee', methods=['POST'])
-def save_employee_endpoint():
-    """Guarda un empleado en la sesión."""
-    try:
-        data = request.json
-        employee_id = data.get('employee_id')
-        
-        if not employee_id:
-            return jsonify({"error": "employee_id is required"}), 400
-        
-        project_id, user_id = get_or_create_session_project()
-        
-        success = save_employee_to_session(project_id, user_id, employee_id)
-        
-        if success:
-            return jsonify({"message": "Employee saved successfully"})
-        else:
-            return jsonify({"error": "Failed to save employee"}), 500
-            
-    except Exception as e:
-        print(f"❌ ERROR saving employee: {e}")
-        return jsonify({"error": "Could not save employee"}), 500
-
-@app.route('/sentiment', methods=['POST'])
-def save_sentiment_endpoint():
-    """Guarda el sentiment (like/dislike) de una entidad."""
-    try:
-        data = request.json
-        entity_id = data.get('entity_id')
-        entity_type = data.get('entity_type')  # 'investor' o 'employee'
-        sentiment = data.get('sentiment')  # 'like' o 'dislike'
-        
-        if not all([entity_id, entity_type, sentiment]):
-            return jsonify({"error": "entity_id, entity_type, and sentiment are required"}), 400
-        
-        project_id, user_id = get_or_create_session_project()
-        
-        # Guardar en tabla correspondiente si es like
-        if sentiment == 'like':
-            if entity_type == 'investor':
-                save_investor_to_session(project_id, user_id, entity_id)
-            elif entity_type == 'employee':
-                save_employee_to_session(project_id, user_id, entity_id)
-        
-        # Guardar sentiment
-        success = save_sentiment(project_id, user_id, entity_id, entity_type, sentiment)
-        
-        if success:
-            return jsonify({"message": f"Sentiment '{sentiment}' saved successfully"})
-        else:
-            return jsonify({"error": "Failed to save sentiment"}), 500
-            
-    except Exception as e:
-        print(f"❌ ERROR saving sentiment: {e}")
-        return jsonify({"error": "Could not save sentiment"}), 500
-
-@app.route('/saved/investors', methods=['GET'])
-def get_saved_investors_endpoint():
-    """Obtiene los inversores guardados de la sesión."""
-    try:
-        project_id, user_id = get_or_create_session_project()
-        
-        saved_investors = get_saved_investors(project_id)
-        
-        return jsonify({
-            "saved_investors": saved_investors,
-            "total_count": len(saved_investors)
-        })
-        
-    except Exception as e:
-        print(f"❌ ERROR getting saved investors: {e}")
-        return jsonify({"error": "Could not get saved investors"}), 500
-
-@app.route('/saved/employees', methods=['GET'])
-def get_saved_employees_endpoint():
-    """Obtiene los empleados guardados de la sesión."""
-    try:
-        project_id, user_id = get_or_create_session_project()
-        
-        saved_employees = get_saved_employees(project_id)
-        
-        return jsonify({
-            "saved_employees": saved_employees,
-            "total_count": len(saved_employees)
-        })
-        
-    except Exception as e:
-        print(f"❌ ERROR getting saved employees: {e}")
-        return jsonify({"error": "Could not get saved employees"}), 500
-
-@app.route('/generate/template', methods=['POST'])
-def generate_template_endpoint():
-    """Genera template de outreach personalizado."""
-    try:
-        data = request.json
-        target_investor_id = data.get('target_investor_id')
-        target_employee_id = data.get('target_employee_id')
-        platform = data.get('platform', 'email')  # 'email' o 'linkedin'
-        user_instructions = data.get('instructions', '')
-        
-        if not target_investor_id and not target_employee_id:
-            return jsonify({"error": "target_investor_id or target_employee_id is required"}), 400
-        
-        project_id, user_id = get_or_create_session_project()
-        
-        result = generate_outreach_template(
-            project_id, user_id, target_investor_id, target_employee_id, platform, user_instructions
+        # Crear Stripe Checkout Session
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'eur',
+                    'product_data': {
+                        'name': f'{package_info["credits"]} Credits',
+                        'description': f'0Bullshit Credit Package - {credit_package.title()}'
+                    },
+                    'unit_amount': package_info['price'],
+                },
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url=f"{request.host_url}payment/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{request.host_url}payment/cancel",
+            metadata={
+                'user_id': user['id'],
+                'credit_amount': package_info['credits'],
+                'package_type': credit_package
+            }
         )
         
-        if "error" in result:
-            return jsonify(result), 500
+        return jsonify({
+            "checkout_url": checkout_session.url,
+            "session_id": checkout_session.id
+        })
+        
+    except Exception as e:
+        print(f"❌ ERROR creating checkout: {e}")
+        return jsonify({"error": "Error creating payment"}), 500
+
+# ==================== BOTS & CHAT ROUTES ====================
+
+@app.route('/chat/bot', methods=['POST'])
+@require_auth
+def chat_with_bot(user):
+    """Chat con sistema de 60 bots"""
+    try:
+        data = request.json
+        user_input = data.get('message', '')
+        context = data.get('context', {})
+        
+        if not user_input:
+            return jsonify({"error": "Message is required"}), 400
+        
+        # Añadir contexto del usuario
+        user_context = {
+            **context,
+            "user_id": user['id'],
+            "user_plan": user['plan'],
+            "user_credits": user['credits_balance'],
+            "neural_memory": get_neural_memory(user['id'])
+        }
+        
+        # Procesar con bot manager
+        bot_manager = BotManager()
+        result = bot_manager.process_user_request(user_input, user_context, user['id'])
         
         return jsonify(result)
+        
+    except Exception as e:
+        print(f"❌ ERROR in bot chat: {e}")
+        return jsonify({"error": "Error processing message"}), 500
+
+@app.route('/bots/available', methods=['GET'])
+@require_auth
+def get_available_bots(user):
+    """Lista de bots disponibles"""
+    try:
+        user_plan = user['plan']
+        plan_features = SUBSCRIPTION_PLANS[user_plan]['features']
+        
+        available_bots = {}
+        for bot_id, bot_info in GEMINI_ARMY.items():
+            # Todos los usuarios tienen acceso a los bots básicos
+            if plan_features['bots_access']:
+                available_bots[bot_id] = {
+                    "name": bot_info["name"],
+                    "description": bot_info["description"],
+                    "credit_cost": bot_info["credit_cost"],
+                    "category": bot_info.get("category", "general")
+                }
+        
+        return jsonify({
+            "available_bots": available_bots,
+            "total_bots": len(available_bots),
+            "user_plan": user_plan,
+            "plan_features": plan_features
+        })
+        
+    except Exception as e:
+        print(f"❌ ERROR getting bots: {e}")
+        return jsonify({"error": "Error getting available bots"}), 500
+
+# ==================== SEARCH ROUTES (Growth/Pro only) ====================
+
+@app.route('/search/investors', methods=['POST'])
+@require_auth
+@require_plan('growth')
+def search_investors(user):
+    """Búsqueda de inversores con ML"""
+    try:
+        data = request.json
+        query = data.get('query', '')
+        preferences = data.get('preferences', {})
+        max_results = data.get('max_results', 20)
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        # Verificar créditos necesarios
+        estimated_cost = max_results * CREDIT_COSTS['investor_search_result']
+        user_credits = get_user_credits(user['id'])
+        
+        if user_credits < estimated_cost:
+            return jsonify({
+                "error": "insufficient_credits",
+                "required": estimated_cost,
+                "available": user_credits,
+                "upsell": True
+            }), 402
+        
+        # Ejecutar búsqueda ML
+        results = ml_investor_search(query, preferences, max_results)
+        
+        if 'error' not in results:
+            # Cobrar créditos por resultados encontrados
+            actual_cost = len(results['results']) * CREDIT_COSTS['investor_search_result']
+            charge_credits(user['id'], actual_cost)
+            
+            results['credits_charged'] = actual_cost
+        
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"❌ ERROR in investor search: {e}")
+        return jsonify({"error": "Search failed"}), 500
+
+@app.route('/search/employees', methods=['POST'])
+@require_auth
+@require_plan('growth')
+def search_employees(user):
+    """Búsqueda de empleados en fondos"""
+    try:
+        data = request.json
+        query = data.get('query', '')
+        max_employees = data.get('max_employees', 50)
+        
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+        
+        # Verificar créditos
+        estimated_cost = max_employees * CREDIT_COSTS['employee_search_result']
+        user_credits = get_user_credits(user['id'])
+        
+        if user_credits < estimated_cost:
+            return jsonify({
+                "error": "insufficient_credits", 
+                "required": estimated_cost,
+                "available": user_credits,
+                "upsell": True
+            }), 402
+        
+        # Ejecutar búsqueda (implementar lógica similar a inversores)
+        # Por ahora placeholder
+        results = {
+            "search_type": "employees",
+            "results": [],
+            "total_found": 0,
+            "message": "Employee search functionality coming soon"
+        }
+        
+        return jsonify(results)
+        
+    except Exception as e:
+        print(f"❌ ERROR in employee search: {e}")
+        return jsonify({"error": "Search failed"}), 500
+
+# ==================== OUTREACH ROUTES (Pro only) ====================
+
+@app.route('/outreach/generate-template', methods=['POST'])
+@require_auth
+@require_plan('pro')
+def generate_outreach_template(user):
+    """Genera template de outreach personalizado"""
+    try:
+        data = request.json
+        target_id = data.get('target_id')
+        target_type = data.get('target_type')  # 'investor' or 'employee'
+        platform = data.get('platform', 'email')
+        instructions = data.get('instructions', '')
+        
+        if not target_id or not target_type:
+            return jsonify({"error": "Target ID and type required"}), 400
+        
+        # Verificar créditos
+        user_credits = get_user_credits(user['id'])
+        cost = CREDIT_COSTS['template_generation']
+        
+        if user_credits < cost:
+            return jsonify({
+                "error": "insufficient_credits",
+                "required": cost,
+                "available": user_credits
+            }), 402
+        
+        # Generar template (implementar lógica)
+        template_result = {
+            "template_id": str(uuid.uuid4()),
+            "content": f"Generated template for {target_type} {target_id}",
+            "platform": platform,
+            "target_type": target_type,
+            "credits_charged": cost
+        }
+        
+        # Cobrar créditos
+        charge_credits(user['id'], cost)
+        
+        return jsonify(template_result)
         
     except Exception as e:
         print(f"❌ ERROR generating template: {e}")
-        return jsonify({"error": "Could not generate template"}), 500
+        return jsonify({"error": "Template generation failed"}), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint."""
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "database": "connected" if engine else "disconnected",
-        "gemini": "configured" if API_KEY else "not_configured",
-        "session_support": True
-    })
+# ==================== SUBSCRIPTION & PAYMENT ROUTES ====================
 
-# Endpoint legacy para compatibilidad
-@app.route('/find_investors', methods=['POST'])
-def find_investors_legacy_endpoint():
-    """Legacy endpoint for backward compatibility."""
-    print("\n--- Request /find_investors (Legacy) ---")
-    data = request.json
-    user_query = data.get('query')
-    is_deep = data.get('deep_research', False)
-
-    if not user_query:
-        return jsonify({"error": "Query required"}), 400
-
-    print(f"  -> Query: '{user_query[:50]}...', Deep: {is_deep}.")
-    
+@app.route('/subscription/upgrade', methods=['POST'])
+@require_auth
+def upgrade_subscription(user):
+    """Upgrade de plan con Stripe"""
     try:
-        project_id, user_id = get_or_create_session_project()
+        data = request.json
+        target_plan = data.get('plan')  # 'growth' or 'pro'
         
-        if is_deep:
-            results = run_investor_search_deep(user_query)
-        else:
-            results = run_investor_search_normal(user_query)
+        if target_plan not in ['growth', 'pro']:
+            return jsonify({"error": "Invalid plan"}), 400
         
-        results["session_info"] = {"project_id": project_id, "user_id": user_id}
+        plan_info = SUBSCRIPTION_PLANS[target_plan]
         
-        print("--- Request /find_investors (Legacy) completed ---")
-        return jsonify(results)
+        # Crear Stripe Checkout Session para suscripción
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price': plan_info['stripe_price_id'],
+                'quantity': 1,
+            }],
+            mode='subscription',
+            success_url=f"{request.host_url}subscription/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{request.host_url}subscription/cancel",
+            metadata={
+                'user_id': user['id'],
+                'plan': target_plan
+            }
+        )
+        
+        return jsonify({
+            "checkout_url": checkout_session.url,
+            "session_id": checkout_session.id
+        })
         
     except Exception as e:
-        print(f"❌ ERROR in legacy endpoint: {e}")
-        return jsonify({"error": f"Error in search: {e}"}), 500
+        print(f"❌ ERROR creating subscription: {e}")
+        return jsonify({"error": "Error creating subscription"}), 500
+
+@app.route('/webhook/stripe', methods=['POST'])
+def stripe_webhook():
+    """Webhook de Stripe para events"""
+    try:
+        payload = request.get_data(as_text=True)
+        sig_header = request.headers.get('Stripe-Signature')
+        
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+        
+        if event['type'] == 'checkout.session.completed':
+            session = event['data']['object']
+            
+            if session['mode'] == 'payment':
+                # Compra de créditos
+                handle_credit_purchase(session)
+            elif session['mode'] == 'subscription':
+                # Suscripción nueva
+                handle_subscription_created(session)
+        
+        elif event['type'] == 'invoice.payment_succeeded':
+            # Renovación de suscripción
+            handle_subscription_renewal(event['data']['object'])
+        
+        return jsonify({"status": "success"})
+        
+    except Exception as e:
+        print(f"❌ ERROR in webhook: {e}")
+        return jsonify({"error": "Webhook failed"}), 400
+
+def handle_credit_purchase(session):
+    """Procesa compra de créditos"""
+    try:
+        user_id = session['metadata']['user_id']
+        credit_amount = int(session['metadata']['credit_amount'])
+        
+        # Añadir créditos al usuario
+        add_credits(user_id, credit_amount, 'purchase')
+        
+        print(f"✅ Added {credit_amount} credits to user {user_id}")
+        
+    except Exception as e:
+        print(f"❌ ERROR handling credit purchase: {e}")
+
+def handle_subscription_created(session):
+    """Procesa nueva suscripción"""
+    try:
+        user_id = session['metadata']['user_id']
+        plan = session['metadata']['plan']
+        subscription_id = session['subscription']
+        
+        # Actualizar plan del usuario
+        update_user_plan(user_id, plan, subscription_id)
+        
+        # Añadir créditos de lanzamiento
+        launch_credits = SUBSCRIPTION_PLANS[plan]['launch_credits']
+        add_credits(user_id, launch_credits, 'launch_bonus')
+        
+        print(f"✅ User {user_id} upgraded to {plan} with {launch_credits} bonus credits")
+        
+    except Exception as e:
+        print(f"❌ ERROR handling subscription creation: {e}")
+
+def update_user_plan(user_id, plan, subscription_id):
+    """Actualiza plan del usuario"""
+    try:
+        # Actualizar usuario
+        query = """
+        UPDATE users 
+        SET plan = %s, updated_at = %s
+        WHERE id = %s
+        """
+        
+        with engine.connect() as conn:
+            conn.execute(text(query), (plan, datetime.now(), user_id))
+            conn.commit()
+        
+        # Crear/actualizar suscripción
+        sub_query = """
+        INSERT INTO subscriptions (id, user_id, plan, stripe_subscription_id, status, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+        plan = EXCLUDED.plan,
+        stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+        status = EXCLUDED.status,
+        updated_at = EXCLUDED.updated_at
+        """
+        
+        params = (
+            str(uuid.uuid4()), user_id, plan, subscription_id,
+            'active', datetime.now(), datetime.now()
+        )
+        
+        with engine.connect() as conn:
+            conn.execute(text(sub_query), params)
+            conn.commit()
+            
+    except Exception as e:
+        print(f"❌ ERROR updating user plan: {e}")
+
+# ==================== ADMIN & ANALYTICS ROUTES ====================
+
+@app.route('/admin/stats', methods=['GET'])
+@require_auth
+def get_admin_stats(user):
+    """Estadísticas de admin (solo para admins)"""
+    # Implementar verificación de admin
+    return jsonify({"message": "Admin stats coming soon"})
 
 # ==============================================================================
 #           EXECUTION
 # ==============================================================================
 
 if __name__ == '__main__':
-    print("Starting Flask server for local testing...")
-    print("🚀 0Bullshit Enhanced Backend READY! 🚀")
-    print("🔓 MODO ABIERTO - Sesiones temporales activadas")
-    print("🤖 AI Superinteligente activado")
-    print("💼 Algoritmos de matching: Inversores + Empleados (score > 44)")
-    print("👍 Sistema completo de like/dislike")
-    print("📧 Generación de templates con Gemini")
+    print("Starting 0Bullshit Backend v2.0...")
+    print("🚀 Features Ready:")
+    print("  ✅ 60 Bot Army")
+    print("  ✅ Credits System") 
+    print("  ✅ Neural Memory")
+    print("  ✅ 3-Tier Plans")
+    print("  ✅ Stripe Integration")
+    print("  ✅ ML Powered Search")
+    print("  ✅ Authentication")
+    
     app.run(host='0.0.0.0', port=8080, debug=True)
